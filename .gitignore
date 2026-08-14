@@ -1,0 +1,5 @@
+.env
+myapi/
+__pycache__/
+*.pyc
+.kis_token_cache.json
