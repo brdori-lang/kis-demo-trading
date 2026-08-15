@@ -43,8 +43,80 @@ class SQLiteLabRepository:
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS stock_master (
+                    stock_code TEXT PRIMARY KEY,
+                    stock_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    refreshed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
+
+    def replace_stock_master(self, stocks: list[dict]):
+        if not stocks:
+            raise ValueError("적재할 종목 마스터가 비어 있습니다.")
+        rows = [
+            (item["stock_code"], item["stock_name"], item["market"])
+            for item in stocks
+        ]
+        with self._connect() as connection:
+            connection.execute("DELETE FROM stock_master")
+            connection.executemany(
+                """
+                INSERT INTO stock_master (stock_code, stock_name, market)
+                VALUES (?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def count_stocks(self):
+        with self._connect() as connection:
+            row = connection.execute("SELECT COUNT(*) FROM stock_master").fetchone()
+        return row[0]
+
+    def search_stocks(self, query: str, limit: int = 20):
+        code_prefix = f"{query}%"
+        name_prefix = f"{query}%"
+        name_contains = f"%{query}%"
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT stock_code, stock_name
+                FROM stock_master
+                WHERE stock_code LIKE ?
+                   OR stock_name LIKE ? COLLATE NOCASE
+                ORDER BY CASE
+                    WHEN stock_code = ? THEN 0
+                    WHEN stock_code LIKE ? THEN 1
+                    WHEN stock_name = ? COLLATE NOCASE THEN 2
+                    WHEN stock_name LIKE ? COLLATE NOCASE THEN 3
+                    ELSE 4
+                END,
+                stock_name COLLATE NOCASE,
+                stock_code
+                LIMIT ?
+                """,
+                (
+                    code_prefix,
+                    name_contains,
+                    query,
+                    code_prefix,
+                    query,
+                    name_prefix,
+                    limit,
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_stock(self, stock_code: str):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT stock_code, stock_name FROM stock_master WHERE stock_code = ?",
+                (stock_code,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def clear(self):
         with self._connect() as connection:

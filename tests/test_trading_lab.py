@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_module
+import trading_lab as trading_lab_module
 from lab_repository import SQLiteLabRepository
 from trading_lab import LabStore, calculate_signal, search_stocks
 
@@ -11,8 +12,16 @@ client = TestClient(main_module.app)
 
 @pytest.fixture(autouse=True)
 def isolated_lab_store(tmp_path, monkeypatch):
-    test_store = LabStore(SQLiteLabRepository(tmp_path / "api-test.db"))
+    repository = SQLiteLabRepository(tmp_path / "api-test.db")
+    repository.replace_stock_master(
+        [
+            {"stock_code": "005930", "stock_name": "삼성전자", "market": "KOSPI"},
+            {"stock_code": "000660", "stock_name": "SK하이닉스", "market": "KOSPI"},
+        ]
+    )
+    test_store = LabStore(repository)
     monkeypatch.setattr(main_module, "store", test_store)
+    monkeypatch.setattr(trading_lab_module, "store", test_store)
     yield test_store
 
 

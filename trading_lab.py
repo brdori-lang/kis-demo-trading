@@ -1,20 +1,7 @@
 from pathlib import Path
 
 from lab_repository import SQLiteLabRepository
-
-
-STOCK_CATALOG = {
-    "005930": "삼성전자",
-    "000660": "SK하이닉스",
-    "373220": "LG에너지솔루션",
-    "207940": "삼성바이오로직스",
-    "005380": "현대차",
-    "000270": "기아",
-    "068270": "셀트리온",
-    "035420": "NAVER",
-    "035720": "카카오",
-    "105560": "KB금융",
-}
+from stock_master import normalize_stock_code
 
 
 class LabStore:
@@ -61,21 +48,24 @@ class LabStore:
     def list_orders(self):
         return self.repository.list_orders()
 
+    def search_stocks(self, query: str, limit: int = 20):
+        normalized_query = query.strip()
+        if not normalized_query:
+            return []
+        return self.repository.search_stocks(normalized_query, limit)
+
+    def stock_name(self, stock_code: str):
+        normalized_code = normalize_stock_code(stock_code)
+        stock = self.repository.get_stock(normalized_code)
+        return stock["stock_name"] if stock else normalized_code
+
 
 def search_stocks(query: str, limit: int = 20):
-    normalized = query.strip().lower()
-    if not normalized:
-        return []
-    matches = [
-        {"stock_code": code, "stock_name": name}
-        for code, name in STOCK_CATALOG.items()
-        if normalized in code.lower() or normalized in name.lower()
-    ]
-    return matches[:limit]
+    return store.search_stocks(query, limit)
 
 
 def stock_name(stock_code: str):
-    return STOCK_CATALOG.get(stock_code, stock_code)
+    return store.stock_name(stock_code)
 
 
 def calculate_signal(current_price: int, condition: dict | None):
