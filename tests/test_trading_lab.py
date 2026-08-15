@@ -2,17 +2,18 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_module
-from trading_lab import calculate_signal, search_stocks, store
+from lab_repository import SQLiteLabRepository
+from trading_lab import LabStore, calculate_signal, search_stocks
 
 
 client = TestClient(main_module.app)
 
 
 @pytest.fixture(autouse=True)
-def clear_lab_store():
-    store.clear()
-    yield
-    store.clear()
+def isolated_lab_store(tmp_path, monkeypatch):
+    test_store = LabStore(SQLiteLabRepository(tmp_path / "api-test.db"))
+    monkeypatch.setattr(main_module, "store", test_store)
+    yield test_store
 
 
 def fake_price(stock_code: str):

@@ -1,5 +1,6 @@
-from dataclasses import asdict, dataclass
-from threading import Lock
+from pathlib import Path
+
+from lab_repository import SQLiteLabRepository
 
 
 STOCK_CATALOG = {
@@ -16,43 +17,18 @@ STOCK_CATALOG = {
 }
 
 
-@dataclass
-class WatchItem:
-    stock_code: str
-    stock_name: str
-
-
-@dataclass
-class Condition:
-    stock_code: str
-    buy_below: int | None = None
-    sell_above: int | None = None
-
-
 class LabStore:
-    def __init__(self):
-        self.watchlist: dict[str, WatchItem] = {}
-        self.conditions: dict[str, Condition] = {}
-        self.orders: list[dict] = []
-        self._next_order_id = 1
-        self._lock = Lock()
+    def __init__(self, repository: SQLiteLabRepository):
+        self.repository = repository
 
     def clear(self):
-        with self._lock:
-            self.watchlist.clear()
-            self.conditions.clear()
-            self.orders.clear()
-            self._next_order_id = 1
+        self.repository.clear()
 
     def add_watch(self, stock_code: str, stock_name: str):
-        with self._lock:
-            item = WatchItem(stock_code=stock_code, stock_name=stock_name)
-            self.watchlist[stock_code] = item
-            return asdict(item)
+        return self.repository.upsert_watch(stock_code, stock_name)
 
     def list_watch(self):
-        with self._lock:
-            return [asdict(item) for item in self.watchlist.values()]
+        return self.repository.list_watch()
 
     def set_condition(self, stock_code: str, buy_below: int | None, sell_above: int | None):
         if buy_below is None and sell_above is None:
@@ -61,38 +37,29 @@ class LabStore:
             raise ValueError("매수 기준가는 양수여야 합니다.")
         if sell_above is not None and sell_above <= 0:
             raise ValueError("매도 기준가는 양수여야 합니다.")
-        with self._lock:
-            condition = Condition(stock_code, buy_below, sell_above)
-            self.conditions[stock_code] = condition
-            return asdict(condition)
+        if not self.repository.watch_exists(stock_code):
+            raise ValueError("관심종목을 먼저 등록해야 합니다.")
+        return self.repository.upsert_condition(stock_code, buy_below, sell_above)
 
     def get_condition(self, stock_code: str):
-        with self._lock:
-            condition = self.conditions.get(stock_code)
-            return asdict(condition) if condition else None
+        return self.repository.get_condition(stock_code)
 
     def add_order(self, stock_code: str, stock_name: str, side: str, quantity: int, price: int):
         if side not in {"buy", "sell"}:
             raise ValueError("매수 또는 매도만 가능합니다.")
         if quantity <= 0 or price <= 0:
             raise ValueError("수량과 가격은 양수여야 합니다.")
-        with self._lock:
-            order = {
-                "id": self._next_order_id,
-                "stock_code": stock_code,
-                "stock_name": stock_name,
-                "side": side,
-                "quantity": quantity,
-                "price": price,
-                "status": "mock_filled",
-            }
-            self._next_order_id += 1
-            self.orders.insert(0, order)
-            return dict(order)
+        return self.repository.insert_order(
+            stock_code,
+            stock_name,
+            side,
+            quantity,
+            price,
+            "mock_filled",
+        )
 
     def list_orders(self):
-        with self._lock:
-            return [dict(order) for order in self.orders]
+        return self.repository.list_orders()
 
 
 def search_stocks(query: str, limit: int = 20):
@@ -123,4 +90,5 @@ def calculate_signal(current_price: int, condition: dict | None):
     return "HOLD"
 
 
-store = LabStore()
+DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "trading_lab.db"
+store = LabStore(SQLiteLabRepository(DEFAULT_DB_PATH))

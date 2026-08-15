@@ -3,3 +3,6 @@ myapi/
 __pycache__/
 *.pyc
 .kis_token_cache.json
+data/*.db
+data/*.db-wal
+data/*.db-shm
