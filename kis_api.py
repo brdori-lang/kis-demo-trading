@@ -115,6 +115,29 @@ def get_account_balance():
     return response.json()
 
 
+def get_daily_item_chart_price(stock_code: str, start_date: str, end_date: str):
+    access_token = get_access_token()
+    url = f"{KIS_VIRTUAL_DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    headers = {
+        "authorization": f"Bearer {access_token}",
+        "appkey": settings.KIS_APP_KEY,
+        "appsecret": settings.KIS_APP_SECRET,
+        "tr_id": "FHKST03010100",
+        "custtype": "P",
+    }
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": stock_code,
+        "FID_INPUT_DATE_1": start_date,
+        "FID_INPUT_DATE_2": end_date,
+        "FID_PERIOD_DIV_CODE": "D",
+        "FID_ORG_ADJ_PRC": "0",
+    }
+    response = _kis_get(url, headers, params)
+    response.raise_for_status()
+    return response.json()
+
+
 if __name__ == "__main__":
     result = get_current_price("005930")
 

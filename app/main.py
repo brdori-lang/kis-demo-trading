@@ -1,8 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from indicators import calculate_technical_indicators
 from kis_api import get_account_balance, get_current_price
+from market_data import DailyMarketDataService
+from strategy_engine import evaluate_lab_strategy_v1
 from trading_lab import calculate_signal, search_stocks, stock_name, store
 
 
@@ -175,6 +178,60 @@ def _price_for(stock_code: str):
 @app.get("/api/stocks/search")
 def stock_search(q: str):
     return {"items": search_stocks(q)}
+
+
+@app.get("/api/stocks/{stock_code}/daily")
+def daily_prices(
+    stock_code: str,
+    days: int = Query(default=100, ge=1, le=100),
+    refresh: bool = False,
+):
+    try:
+        service = DailyMarketDataService(store.repository)
+        return service.get_daily_prices(stock_code, days, refresh)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    except Exception:
+        raise HTTPException(status_code=502, detail="일봉 조회에 실패했습니다.") from None
+
+
+@app.get("/api/stocks/{stock_code}/indicators")
+def technical_indicators(
+    stock_code: str,
+    recent: int = Query(default=20, ge=1, le=100),
+):
+    try:
+        service = DailyMarketDataService(store.repository)
+        market_data = service.get_daily_prices(stock_code, days=100)
+        indicator_items = calculate_technical_indicators(market_data["items"])
+        latest = indicator_items[-1] if indicator_items else None
+        return {
+            "stock_code": market_data["stock_code"],
+            "as_of_date": latest["trade_date"] if latest else None,
+            "data_points": len(indicator_items),
+            "latest": latest,
+            "items": indicator_items[-recent:],
+        }
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    except Exception:
+        raise HTTPException(status_code=502, detail="기술지표 계산에 실패했습니다.") from None
+
+
+@app.get("/api/stocks/{stock_code}/strategy")
+def lab_strategy(stock_code: str):
+    try:
+        service = DailyMarketDataService(store.repository)
+        market_data = service.get_daily_prices(stock_code, days=100)
+        indicators = calculate_technical_indicators(market_data["items"])
+        closes = {item["trade_date"]: item["close_price"] for item in market_data["items"]}
+        rows = [dict(item, close_price=closes[item["trade_date"]]) for item in indicators]
+        result = evaluate_lab_strategy_v1(rows)
+        return {"stock_code": market_data["stock_code"], **result}
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    except Exception:
+        raise HTTPException(status_code=502, detail="Strategy 평가에 실패했습니다.") from None
 
 
 @app.post("/api/watchlist")

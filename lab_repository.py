@@ -50,8 +50,107 @@ class SQLiteLabRepository:
                     market TEXT NOT NULL,
                     refreshed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS daily_prices (
+                    stock_code TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    open_price INTEGER NOT NULL,
+                    high_price INTEGER NOT NULL,
+                    low_price INTEGER NOT NULL,
+                    close_price INTEGER NOT NULL,
+                    volume INTEGER NOT NULL,
+                    trading_value INTEGER NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY (stock_code, trade_date)
+                );
                 """
             )
+
+    def upsert_daily_prices(self, stock_code: str, items: list[dict], fetched_at: str):
+        if not items:
+            raise ValueError("저장할 일봉 데이터가 비어 있습니다.")
+        rows = [
+            (
+                stock_code,
+                item["trade_date"],
+                item["open_price"],
+                item["high_price"],
+                item["low_price"],
+                item["close_price"],
+                item["volume"],
+                item["trading_value"],
+                fetched_at,
+            )
+            for item in items
+        ]
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO daily_prices (
+                    stock_code, trade_date, open_price, high_price, low_price,
+                    close_price, volume, trading_value, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stock_code, trade_date) DO UPDATE SET
+                    open_price = excluded.open_price,
+                    high_price = excluded.high_price,
+                    low_price = excluded.low_price,
+                    close_price = excluded.close_price,
+                    volume = excluded.volume,
+                    trading_value = excluded.trading_value,
+                    fetched_at = excluded.fetched_at
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def get_daily_prices(self, stock_code: str, limit: int):
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT trade_date, open_price, high_price, low_price,
+                       close_price, volume, trading_value, fetched_at
+                FROM daily_prices
+                WHERE stock_code = ?
+                ORDER BY trade_date DESC
+                LIMIT ?
+                """,
+                (stock_code, limit),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def get_daily_price_cache_info(self, stock_code: str):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS item_count,
+                       MAX(trade_date) AS latest_trade_date,
+                       (
+                           SELECT fetched_at
+                           FROM daily_prices AS latest
+                           WHERE latest.stock_code = daily_prices.stock_code
+                           ORDER BY trade_date DESC
+                           LIMIT 1
+                       ) AS last_fetched_at
+                FROM daily_prices
+                WHERE stock_code = ?
+                """,
+                (stock_code,),
+            ).fetchone()
+        return dict(row)
+
+    def get_daily_price_range_info(self, stock_code: str):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS item_count,
+                       MIN(trade_date) AS oldest_trade_date,
+                       MAX(trade_date) AS latest_trade_date
+                FROM daily_prices
+                WHERE stock_code = ?
+                """,
+                (stock_code,),
+            ).fetchone()
+        return dict(row)
 
     def replace_stock_master(self, stocks: list[dict]):
         if not stocks:

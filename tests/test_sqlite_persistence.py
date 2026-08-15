@@ -77,5 +77,11 @@ def test_database_contains_only_lab_tables_and_fields(tmp_path):
             for row in connection.execute(f"PRAGMA table_info({table})")
         }
 
-    assert tables == {"watchlist", "trading_conditions", "mock_orders", "stock_master"}
+    assert tables == {
+        "watchlist",
+        "trading_conditions",
+        "mock_orders",
+        "stock_master",
+        "daily_prices",
+    }
     assert not {"account_no", "app_key", "app_secret", "access_token"} & columns
