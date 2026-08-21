@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 from indicators import calculate_technical_indicators
 from kis_api import get_account_balance, get_current_price
 from market_data import DailyMarketDataService
+from operations import JOB_DEFINITIONS, OperationsService
+from app.operations_ui import render_operations_ui
 from strategy_engine import evaluate_lab_strategy_v1
 from trading_lab import calculate_signal, search_stocks, stock_name, store
 
@@ -27,6 +29,26 @@ class MockOrderRequest(BaseModel):
     side: str
     quantity: int
     price: int | None = None
+
+
+class OperationSettingsRequest(BaseModel):
+    automation_enabled: bool | None = None
+    dry_run: bool | None = None
+    max_positions: int | None = Field(default=None, ge=1, le=50)
+    max_order_amount: int | None = Field(default=None, ge=10_000)
+    stop_loss_rate: float | None = Field(default=None, gt=0, le=100)
+    take_profit_rate: float | None = Field(default=None, gt=0, le=1000)
+    analysis_schedule: str | None = None
+
+
+class UniverseSettingsRequest(BaseModel):
+    enabled: bool | None = None
+    strategy_name: str | None = Field(default=None, min_length=1, max_length=100)
+    target_weight: float | None = Field(default=None, gt=0, le=100)
+
+
+def operations_service():
+    return OperationsService(store.repository)
 
 
 @app.get("/")
@@ -291,7 +313,127 @@ def get_mock_orders():
 
 @app.get("/api/dashboard")
 def dashboard_data():
-    return {"account": account_balance(), "watchlist": get_watchlist()["items"], "orders": store.list_orders()}
+    account_error = None
+    try:
+        account = account_balance()
+    except HTTPException as error:
+        account = {
+            "total_evaluation_amount": None,
+            "total_purchase_amount": None,
+            "deposit_amount": None,
+            "holdings": [],
+        }
+        account_error = error.detail
+
+    return {
+        "account": account,
+        "account_available": account_error is None,
+        "account_error": account_error,
+        "watchlist": get_watchlist()["items"],
+        "orders": store.list_orders(),
+    }
+
+
+@app.get("/api/operations/overview")
+def operations_overview():
+    return operations_service().overview(store)
+
+
+@app.get("/api/operations/settings")
+def get_operation_settings():
+    return operations_service().get_settings()
+
+
+@app.put("/api/operations/settings")
+def update_operation_settings(payload: OperationSettingsRequest):
+    try:
+        values = payload.model_dump(exclude_none=True)
+        return operations_service().save_settings(values)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+
+@app.get("/api/operations/signals")
+def operation_signals():
+    return {"items": operations_service().list_signals()}
+
+
+@app.get("/api/operations/universe")
+def operation_universe():
+    return {"items": operations_service().list_universe(store)}
+
+
+@app.put("/api/operations/universe/{stock_code}")
+def update_operation_universe(stock_code: str, payload: UniverseSettingsRequest):
+    try:
+        return operations_service().update_universe(
+            store, stock_code, payload.model_dump(exclude_none=True)
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+
+@app.get("/api/operations/data-status")
+def operation_data_status():
+    return {"items": operations_service().data_status(store)}
+
+
+@app.get("/api/operations/backtests")
+def operation_backtests():
+    return {"items": operations_service().list_backtests()}
+
+
+@app.get("/api/operations/jobs")
+def operation_jobs():
+    return {"items": operations_service().list_jobs()}
+
+
+@app.get("/api/operations/job-runs")
+def operation_job_runs(limit: int = Query(default=100, ge=1, le=500)):
+    return {"items": operations_service().list_job_runs(limit)}
+
+
+@app.post("/api/operations/jobs/{job_name}/run")
+def run_operation_job(job_name: str):
+    if job_name not in JOB_DEFINITIONS:
+        raise HTTPException(status_code=404, detail="등록되지 않은 작업입니다.")
+    try:
+        return operations_service().run_job(job_name, store)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    except Exception:
+        raise HTTPException(status_code=500, detail="배치 작업 실행에 실패했습니다.") from None
+
+
+@app.get("/api/operations/logs")
+def operation_logs(limit: int = Query(default=100, ge=1, le=500)):
+    return {"items": operations_service().list_logs(limit)}
+
+
+@app.get("/ui/operations", response_class=HTMLResponse)
+def operations_ui():
+    return render_operations_ui()
+    return """
+    <!doctype html><html lang="ko"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>KIS Trading LAB · 운영센터</title><style>
+    :root{color-scheme:dark;--bg:#070b14;--panel:#101827;--line:#243147;--text:#f4f7fb;--muted:#8d9bb0;--blue:#4c8dff;--green:#22c99a;--red:#ff5268;--amber:#f6b94b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,"Noto Sans KR",sans-serif}.header{position:sticky;top:0;z-index:2;display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:#080d17;border-bottom:1px solid var(--line)}h1{font-size:18px;margin:0}.header a{color:#b8c5d8;text-decoration:none}.wrap{max-width:1500px;margin:auto;padding:20px}.tabs{display:flex;gap:8px;overflow:auto;margin-bottom:16px}.tab,.btn{border:1px solid var(--line);background:#111c2e;color:#cbd5e1;border-radius:9px;padding:10px 14px;cursor:pointer;font-weight:700}.tab.active,.btn.primary{background:#285fcf;color:white}.page{display:none}.page.active{display:block}.kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.card,.panel{border:1px solid var(--line);background:linear-gradient(145deg,#111a2a,#0c1320);border-radius:12px;padding:16px}.label{font-size:11px;color:var(--muted)}.value{font-size:25px;font-weight:850;margin-top:8px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px}.panel h2{font-size:15px;margin:0 0 13px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #1d293b;text-align:left;font-size:12px}th{color:#71839d;font-size:10px}.status{min-height:22px;color:var(--green);font-size:12px;margin:10px 0}.jobs{display:grid;gap:9px}.job{display:flex;justify-content:space-between;align-items:center;border:1px solid var(--line);border-radius:10px;padding:12px}.settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.field{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:#09111d;color:white}.badge{padding:4px 8px;border-radius:999px;background:#26354b;font-size:10px}.BUY{color:var(--red)}.SELL{color:#69a6ff}@media(max-width:800px){.wrap{padding:10px}.kpis{grid-template-columns:1fr 1fr}.grid,.settings{grid-template-columns:1fr}.header{padding:12px}.header span{display:none}}
+    </style></head><body><header class="header"><h1>KIS Trading LAB · 운영센터</h1><a href="/ui/dashboard">← 트레이딩 대시보드 <span>돌아가기</span></a></header><main class="wrap">
+    <nav class="tabs"><button class="tab active" data-page="summary">종합현황</button><button class="tab" data-page="automation">자동매매</button><button class="tab" data-page="quant">퀀트분석</button><button class="tab" data-page="performance">성과</button><button class="tab" data-page="system">시스템관리</button></nav>
+    <div id="status" class="status">데이터를 불러오는 중입니다</div>
+    <section id="summary" class="page active"><div class="kpis"><div class="card"><div class="label">대상종목</div><div id="watchKpi" class="value">-</div></div><div class="card"><div class="label">퀀트시그널</div><div id="signalKpi" class="value">-</div></div><div class="card"><div class="label">매수시그널</div><div id="buyKpi" class="value">-</div></div><div class="card"><div class="label">모의주문</div><div id="orderKpi" class="value">-</div></div><div class="card"><div class="label">백테스트</div><div id="backtestKpi" class="value">-</div></div></div><div class="grid"><article class="panel"><h2>자동매매 상태</h2><div id="automationState"></div></article><article class="panel"><h2>최근 배치 상태</h2><div id="recentJobs"></div></article></div></section>
+    <section id="automation" class="page"><div class="grid"><article class="panel"><h2>대상종목</h2><p class="label">관심종목을 가져온 뒤 종목별 자동매매 사용 여부와 목표비중을 관리합니다.</p><div id="universe"></div><a class="btn" href="/ui/dashboard">관심종목 편집</a></article><article class="panel"><h2>매매설정</h2><div class="settings"><label>최대 보유종목<input id="maxPositions" class="field" type="number"/></label><label>종목당 최대금액<input id="maxAmount" class="field" type="number"/></label><label>손절률(%)<input id="stopLoss" class="field" type="number"/></label><label>익절률(%)<input id="takeProfit" class="field" type="number"/></label></div><p><label><input id="automationEnabled" type="checkbox"/> 자동매매 후보 생성 활성화</label></p><button class="btn primary" onclick="saveSettings()">설정 저장</button></article></div><article class="panel" style="margin-top:12px"><h2>매매 실행</h2><p class="label">실제 주문은 전송하지 않고 주문 후보만 생성합니다.</p><button class="btn primary" onclick="runJob('auto_trade_dry_run')">모의 실행</button><div id="candidates"></div></article></section>
+    <section id="quant" class="page"><div class="panel"><h2>퀀트 시그널</h2><button class="btn primary" onclick="runJob('analyze_watchlist')">시그널 분석 실행</button><div id="signals"></div></div><div class="panel" style="margin-top:12px"><h2>백테스팅</h2><button class="btn primary" onclick="runJob('backtest_watchlist')">관심종목 백테스트</button><div id="backtests"></div></div></section>
+    <section id="performance" class="page"><div class="grid"><article class="panel"><h2>성과분석</h2><div id="performanceSummary" class="label">백테스트 결과가 쌓이면 평균수익률과 MDD를 분석합니다.</div></article><article class="panel"><h2>리밸런싱</h2><p class="label">퀀트 점수와 최대 보유종목 설정을 바탕으로 자동매매 후보를 생성합니다.</p><button class="btn" onclick="runJob('auto_trade_dry_run')">리밸런싱 후보 계산</button></article></div><article class="panel" style="margin-top:12px"><h2>매매내역</h2><a class="btn" href="/ui/dashboard">모의주문 내역 보기</a></article></section>
+    <section id="system" class="page"><div class="grid"><article class="panel"><h2>데몬 / 스케줄러</h2><div id="jobs" class="jobs"></div></article><article class="panel"><h2>시스템 설정</h2><label>분석 스케줄<input id="schedule" class="field"/></label><p class="label">Cron 형식으로 저장됩니다. 현재는 수동 실행 기반입니다.</p><button class="btn" onclick="saveSettings()">저장</button><h2 style="margin-top:20px">데이터 최신성</h2><div id="dataStatus"></div></article></div><article class="panel" style="margin-top:12px"><h2>시스템 로그</h2><div id="logs"></div></article></section>
+    </main><script>
+    const api=(u,o)=>fetch(u,o).then(async r=>{const d=await r.json();if(!r.ok)throw Error(d.detail||'요청 실패');return d}),fmt=v=>v==null?'-':Number(v).toLocaleString('ko-KR'),table=(heads,rows)=>`<table><thead><tr>${heads.map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${heads.length}">데이터가 없습니다</td></tr>`}</tbody></table>`;
+    document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab,.page').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById(b.dataset.page).classList.add('active')});
+    async function load(){try{const [o,s,b,l,u]=await Promise.all([api('/api/operations/overview'),api('/api/operations/signals'),api('/api/operations/backtests'),api('/api/operations/logs?limit=30'),api('/api/operations/universe')]);watchKpi.textContent=o.watchlist_count;signalKpi.textContent=o.signal_count;buyKpi.textContent=o.buy_signal_count;orderKpi.textContent=o.mock_order_count;backtestKpi.textContent=o.backtest_count;automationState.innerHTML=`<b>${o.automation.automation_enabled?'활성':'대기'}</b><p class="label">모드: 모의 실행 · 최대 ${o.automation.max_positions}종목 · ${fmt(o.automation.max_order_amount)}원</p>`;maxPositions.value=o.automation.max_positions;maxAmount.value=o.automation.max_order_amount;stopLoss.value=o.automation.stop_loss_rate;takeProfit.value=o.automation.take_profit_rate;automationEnabled.checked=o.automation.automation_enabled;schedule.value=o.automation.analysis_schedule;recentJobs.innerHTML=o.latest_jobs.map(j=>`<p>${j.description}: <span class="badge">${j.latest_run?.status||'미실행'}</span></p>`).join('');jobs.innerHTML=o.latest_jobs.map(j=>`<div class="job"><span>${j.description}<br><small class="label">${j.latest_run?.finished_at||'실행 이력 없음'}</small></span><button class="btn" onclick="runJob('${j.job_name}')">실행</button></div>`).join('');universe.innerHTML=table(['사용','종목','전략','목표비중'],u.items.map(x=>`<tr><td><input type="checkbox" ${x.enabled?'checked':''} onchange="setUniverse('${x.stock_code}',this.checked)"></td><td>${x.stock_name}<br><small>${x.stock_code}</small></td><td>${x.strategy_name}</td><td>${x.target_weight??'-'}%</td></tr>`));dataStatus.innerHTML=table(['종목','건수','최신일'],o.data_status.map(x=>`<tr><td>${x.stock_name}</td><td>${x.data_points}</td><td>${x.latest_trade_date||'-'}</td></tr>`));signals.innerHTML=table(['종목','기준일','시그널','점수'],s.items.map(x=>`<tr><td>${x.stock_name}<br><small>${x.stock_code}</small></td><td>${x.as_of_date||'-'}</td><td class="${x.signal}">${x.signal}</td><td>${x.score}</td></tr>`));backtests.innerHTML=table(['종목','수익률','MDD','거래수','실행일'],b.items.map(x=>`<tr><td>${x.stock_code}</td><td>${(x.total_return*100).toFixed(2)}%</td><td>${(x.mdd*100).toFixed(2)}%</td><td>${x.trade_count}</td><td>${x.created_at.slice(0,19)}</td></tr>`));performanceSummary.textContent=o.average_backtest_return==null?'백테스트를 먼저 실행하세요':`평균 백테스트 수익률 ${(o.average_backtest_return*100).toFixed(2)}%`;logs.innerHTML=table(['시간','레벨','분류','메시지'],l.items.map(x=>`<tr><td>${x.created_at.slice(0,19)}</td><td>${x.level}</td><td>${x.category}</td><td>${x.message}</td></tr>`));status.textContent='운영 데이터 갱신 완료'}catch(e){status.textContent=e.message}}
+    async function saveSettings(){try{await api('/api/operations/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({automation_enabled:automationEnabled.checked,dry_run:true,max_positions:Number(maxPositions.value),max_order_amount:Number(maxAmount.value),stop_loss_rate:Number(stopLoss.value),take_profit_rate:Number(takeProfit.value),analysis_schedule:schedule.value})});status.textContent='설정을 저장했습니다';load()}catch(e){status.textContent=e.message}}
+    async function runJob(name){status.textContent='배치를 실행하는 중입니다';try{const r=await api(`/api/operations/jobs/${name}/run`,{method:'POST'});status.textContent=`${r.job_name}: ${r.items.length}건 완료`;if(name==='auto_trade_dry_run')candidates.innerHTML=table(['종목','시그널','점수','최대금액'],r.items.map(x=>`<tr><td>${x.stock_name}</td><td>${x.signal}</td><td>${x.score}</td><td>${fmt(x.max_order_amount)}원</td></tr>`));load()}catch(e){status.textContent=e.message}}
+    async function setUniverse(code,enabled){try{await api(`/api/operations/universe/${code}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});status.textContent='대상종목 설정을 저장했습니다';load()}catch(e){status.textContent=e.message}}
+    load();</script></body></html>
+    """
 
 
 @app.get("/ui/dashboard", response_class=HTMLResponse)
@@ -301,16 +443,16 @@ def dashboard_ui():
     <html lang="ko"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>KIS Trading LAB</title><style>
       :root{color-scheme:dark;--bg:#070b14;--surface:#0d1422;--surface-2:#111b2d;--line:#202c40;--text:#f4f7fb;--muted:#8d9bb0;--red:#ff4d61;--red-soft:#351824;--blue:#4c8dff;--blue-soft:#13294b;--green:#23c99a;--amber:#f6b94b;--neutral:#99a6b8;--radius:16px}
-      *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 48% -20%,#172b4d 0,transparent 32%),var(--bg);color:var(--text);font-family:Inter,Pretendard,"Noto Sans KR",system-ui,-apple-system,sans-serif;font-variant-numeric:tabular-nums}button,input,select{font:inherit}button{cursor:pointer}.app-header{height:72px;border-bottom:1px solid var(--line);background:#080d17e8;backdrop-filter:blur(14px);position:sticky;top:0;z-index:20}.header-inner{max-width:1540px;height:100%;margin:auto;padding:0 24px;display:flex;align-items:center;justify-content:space-between;gap:18px}.brand{display:flex;align-items:center;gap:13px}.brand-mark{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;font-weight:900;background:linear-gradient(145deg,var(--red),#e1253f);box-shadow:0 0 24px #ff4d6140}.brand h1{font-size:17px;margin:0;letter-spacing:.02em}.brand p{font-size:12px;color:var(--muted);margin:4px 0 0}.header-actions{display:flex;align-items:center;gap:10px}.market-state{font-size:12px;color:var(--green);display:flex;align-items:center;gap:7px}.market-state:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}
+      *{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}body{margin:0;background:radial-gradient(circle at 48% -20%,#172b4d 0,transparent 32%),var(--bg);color:var(--text);font-family:Inter,Pretendard,"Noto Sans KR",system-ui,-apple-system,sans-serif;font-variant-numeric:tabular-nums}button,input,select{font:inherit}button{cursor:pointer}.app-header{height:72px;border-bottom:1px solid var(--line);background:#080d17e8;backdrop-filter:blur(14px);position:sticky;top:0;z-index:20}.header-inner{max-width:1540px;height:100%;margin:auto;padding:0 24px;display:flex;align-items:center;justify-content:space-between;gap:18px;min-width:0}.brand{display:flex;align-items:center;gap:13px;min-width:0}.brand>div:last-child{min-width:0}.brand-mark{width:38px;height:38px;flex:0 0 38px;border-radius:11px;display:grid;place-items:center;font-weight:900;background:linear-gradient(145deg,var(--red),#e1253f);box-shadow:0 0 24px #ff4d6140}.brand h1{font-size:17px;margin:0;letter-spacing:.02em;white-space:nowrap}.brand p{font-size:12px;color:var(--muted);margin:4px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.header-actions{display:flex;align-items:center;gap:10px;flex:0 0 auto}.market-state{font-size:12px;color:var(--green);display:flex;align-items:center;gap:7px}.market-state:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}
       .layout{max-width:1540px;margin:auto;padding:22px 24px 38px}.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:16px}.card,.panel{background:linear-gradient(145deg,#101827,#0c1320);border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 14px 40px #00000024}.kpi{padding:19px 20px;min-height:112px;position:relative;overflow:hidden}.kpi:after{content:"";position:absolute;width:90px;height:90px;border-radius:50%;right:-35px;top:-42px;background:#4c8dff12}.kpi-label{color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.04em}.kpi-value{font-size:25px;font-weight:800;margin-top:14px;letter-spacing:-.03em}.kpi-unit{color:var(--muted);font-size:12px;margin-left:4px}.kpi-note{font-size:11px;color:#66758d;margin-top:7px}.main-grid{display:grid;grid-template-columns:minmax(250px,.8fr) minmax(410px,1.45fr) minmax(280px,.85fr);gap:14px;align-items:stretch}.panel{padding:18px}.panel-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}.panel-title h2{font-size:15px;margin:0}.eyebrow{font-size:10px;color:#6f819b;text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px}.subtle{font-size:11px;color:var(--muted)}
       .btn{border:1px solid transparent;border-radius:9px;padding:10px 13px;font-size:12px;font-weight:750;color:white;background:#28364d;transition:.18s ease}.btn:hover{filter:brightness(1.13);transform:translateY(-1px)}.btn-ghost{background:#111b2b;border-color:#26354b;color:#bdc8d8}.btn-primary{background:linear-gradient(135deg,#3d76ef,#2458c9)}.btn-buy{background:linear-gradient(135deg,#ff5d6f,#e52f49);box-shadow:0 7px 20px #e52f4930}.btn-sell{background:linear-gradient(135deg,#4e91ff,#2865d7);box-shadow:0 7px 20px #2865d730}.btn-block{width:100%}.search-row{display:grid;grid-template-columns:1fr auto;gap:8px}.field{width:100%;border:1px solid #28364c;border-radius:10px;background:#090f1a;color:var(--text);padding:11px 12px;outline:none;transition:.18s}.field:focus{border-color:#4b78c4;box-shadow:0 0 0 3px #356dcc22}.field::placeholder{color:#526176}.search-result{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:8px}.search-result select{min-width:0}.watch-list{display:flex;flex-direction:column;gap:8px;margin-top:16px;max-height:430px;overflow:auto}.watch-item{border:1px solid #1e2a3c;background:#0a111d;border-radius:12px;padding:13px 14px;display:grid;grid-template-columns:1fr auto;gap:8px;transition:.18s;cursor:pointer}.watch-item:hover{border-color:#334a6d;background:#101a2a}.watch-item.active{border-color:#4779c2;background:linear-gradient(135deg,#13233b,#0d1726);box-shadow:inset 3px 0 #4c8dff}.stock-name{font-weight:750;font-size:13px}.stock-code{font-size:10px;color:#6f819a;margin-top:4px}.watch-price{font-weight:800;font-size:14px;text-align:right}.watch-meta{display:flex;align-items:center;gap:7px;margin-top:8px;color:var(--muted);font-size:10px}.badge{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:5px 9px;font-size:10px;font-weight:900;letter-spacing:.05em}.badge.BUY,.side-buy{color:#ff6c7c;background:var(--red-soft);border:1px solid #6b2a3a}.badge.SELL,.side-sell{color:#68a4ff;background:var(--blue-soft);border:1px solid #244d84}.badge.HOLD,.badge.UNAVAILABLE{color:#a8b3c3;background:#202a38;border:1px solid #354255}.empty{color:#66758a;text-align:center;padding:30px 12px;font-size:12px;border:1px dashed #263349;border-radius:11px}.loading{color:#8492a7;animation:pulse 1.2s ease-in-out infinite}@keyframes pulse{50%{opacity:.45}}
       .detail-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;padding-bottom:17px;border-bottom:1px solid var(--line)}.selected-name{font-size:20px;font-weight:850}.selected-code{color:var(--muted);font-size:11px;margin-top:5px}.hero-price{text-align:right}.hero-price strong{display:block;font-size:30px;letter-spacing:-.04em}.hero-price span{font-size:10px;color:var(--muted)}.signal-hero{display:flex;align-items:center;justify-content:space-between;padding:18px 0}.signal-hero .badge{font-size:15px;padding:9px 15px}.signal-caption{font-size:11px;color:var(--muted);margin-top:6px}.indicator-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}.indicator{background:#09111d;border:1px solid #1d2a3d;border-radius:11px;padding:13px}.indicator-label{color:var(--muted);font-size:10px}.indicator-value{font-size:17px;font-weight:800;margin-top:7px}.condition-box{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}.condition-fields{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;margin-top:10px}.condition-fields .field{padding:9px 10px;font-size:12px}
       .paper-label{display:flex;align-items:center;gap:8px;background:#241b0c;border:1px solid #604819;color:#f7c764;border-radius:10px;padding:10px 12px;font-size:11px;font-weight:750;margin-bottom:15px}.paper-label:before{content:"PAPER";font-size:9px;background:#f0ac32;color:#1b1306;padding:3px 5px;border-radius:4px}.order-reference{background:#09111d;border:1px solid #1d2a3d;border-radius:11px;padding:13px;margin-bottom:14px}.order-reference div{display:flex;justify-content:space-between;margin-top:7px;font-size:12px}.order-reference div:first-child{margin-top:0}.order-reference span{color:var(--muted)}.form-group{margin-top:12px}.form-label{display:block;color:var(--muted);font-size:10px;margin-bottom:7px}.order-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:14px}.order-warning{color:#69778c;font-size:10px;line-height:1.55;margin:13px 2px 0}.status-line{min-height:18px;margin-top:10px;font-size:11px;color:var(--green)}
       .bottom-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}.table-panel{overflow:hidden;padding:0}.table-head{padding:18px 20px 4px}.table-wrap{overflow-x:auto;padding:0 12px 14px}table{width:100%;border-collapse:collapse;min-width:580px}th{color:#73839b;text-transform:uppercase;letter-spacing:.05em;font-size:9px;font-weight:800;text-align:left;padding:12px 10px;border-bottom:1px solid var(--line)}td{font-size:12px;padding:13px 10px;border-bottom:1px solid #182437;color:#d7deea}tbody tr{transition:.15s}tbody tr:hover{background:#121d2d}tbody tr:last-child td{border-bottom:0}.number{text-align:right}.profit{color:var(--red);font-weight:750}.loss{color:var(--blue);font-weight:750}.neutral{color:var(--neutral)}
       .layout{max-width:1720px;padding:10px 14px 24px}.kpi-grid{gap:7px;margin-bottom:8px}.card,.panel{border-radius:10px;box-shadow:0 8px 24px #0002}.kpi{padding:9px 14px;min-height:64px;display:grid;grid-template-columns:1fr auto;align-items:center}.kpi-value{font-size:18px;margin:0 12px 0 0;grid-row:1/3;grid-column:2}.kpi-label{font-size:9px}.kpi-note{font-size:8px;margin-top:2px}.main-grid{grid-template-columns:minmax(235px,.68fr) minmax(600px,2fr) minmax(270px,.76fr);gap:8px}.panel{padding:11px}.panel-title{margin-bottom:9px}.watch-head{display:grid;grid-template-columns:1fr 72px 54px 48px;gap:5px;padding:8px 7px 5px;color:#60718a;font-size:8px;border-bottom:1px solid var(--line)}.watch-list{gap:0;margin-top:7px;max-height:530px}.watch-item{border:0;border-left:2px solid transparent;border-bottom:1px solid #192538;border-radius:0;padding:8px 7px;grid-template-columns:1fr 72px 54px 48px;align-items:center;gap:5px}.watch-item.active{border-color:#4c8dff;background:#13223a;box-shadow:none}.watch-item .badge{font-size:7px;padding:3px 5px}.stock-name{font-size:10px}.stock-code{font-size:8px}.watch-price{font-size:10px}.watch-change{text-align:right;font-size:8px;font-weight:800}.detail-head{padding-bottom:8px}.selected-name{font-size:16px}.selected-code{font-size:8px}.hero-price strong{display:inline;font-size:24px}.price-change{font-size:9px;font-weight:800;margin-left:7px}.chart-toolbar{height:27px;display:flex;justify-content:space-between;align-items:center;color:#718198;font-size:8px}.legend{display:flex;gap:10px}.legend span:before{content:"";display:inline-block;width:11px;height:2px;margin-right:4px;vertical-align:middle}.legend .sma5:before{background:#f6b94b}.legend .sma20:before{background:#51a8ff}.chart-shell{height:325px;background:#080e18;border:1px solid #1a2739;border-radius:6px;padding:3px;position:relative}.chart-shell canvas{width:100%;height:100%;display:block}.indicator-strip{display:grid;grid-template-columns:130px 1fr 130px;align-items:center;gap:10px;margin-top:6px;padding:7px 9px;background:#09111d;border:1px solid #1d2a3d;border-radius:6px}.indicator-compact span{color:var(--muted);font-size:8px}.indicator-compact strong{display:block;font-size:13px;margin-top:2px}.meter{height:4px;background:#1d293a;border-radius:4px;overflow:hidden}.meter i{display:block;height:100%;background:linear-gradient(90deg,#3973df,#ff5268)}.strategy-line{display:flex;align-items:center;justify-content:space-between;margin-top:6px;padding:6px 9px;border:1px solid #1b293c;border-radius:6px}.condition-box{margin-top:5px;padding:0;border:0}.condition-box summary{cursor:pointer;color:#71839d;font-size:8px;padding:5px 1px}.condition-fields{margin-top:4px;gap:5px}.condition-fields .field{padding:7px;font-size:9px}.paper-label{padding:7px 9px;margin-bottom:8px;font-size:9px}.ticket-tabs{display:grid;grid-template-columns:1fr 1fr;border:1px solid #27354a;border-radius:7px;overflow:hidden;margin-bottom:8px}.ticket-tab{border:0;padding:8px;background:#111a29;color:#8090a6;font-weight:800}.ticket-tab.active.buy{background:var(--red-soft);color:#ff6678}.ticket-tab.active.sell{background:var(--blue-soft);color:#66a3ff}.order-reference{padding:9px;margin-bottom:8px}.order-reference div{font-size:10px;margin-top:5px}.form-group{margin-top:8px}.form-label{display:flex;justify-content:space-between;font-size:9px;margin-bottom:5px}.estimated{display:flex;justify-content:space-between;align-items:center;margin-top:8px;padding:9px 1px;border-block:1px solid var(--line);font-size:10px}.estimated strong{font-size:14px}.order-warning{font-size:8px;margin-top:8px}.bottom-grid{display:block;margin-top:8px}.table-head{padding:8px 11px 0}.data-tabs{display:flex}.data-tab{border:0;background:transparent;color:#718198;padding:8px 11px;border-bottom:2px solid transparent;font-size:9px;font-weight:800}.data-tab.active{color:#e7edf6;border-color:#4c8dff}.table-pane{display:none}.table-pane.active{display:block}.table-wrap{padding:0 8px 8px;max-height:210px}th{font-size:8px;padding:7px 8px}td{font-size:10px;padding:7px 8px}
-      @media(max-width:1150px){.main-grid{grid-template-columns:235px 1fr}.order-panel{grid-column:1/-1}.order-layout{display:grid;grid-template-columns:1fr 1fr;gap:12px}}@media(max-width:720px){.app-header{height:auto}.header-inner{padding:10px 12px}.market-state{display:none}.layout{padding:8px}.kpi-grid{grid-template-columns:1fr 1fr}.main-grid{grid-template-columns:1fr}.order-panel{grid-column:auto}.order-layout{display:block}.chart-shell{height:270px}.kpi{display:block}.kpi-value{margin-top:5px}.panel{padding:10px}.header-actions .btn span{display:none}}
+      @media(max-width:1150px){.main-grid{grid-template-columns:235px minmax(0,1fr)}.order-panel{grid-column:1/-1}.order-layout{display:grid;grid-template-columns:1fr 1fr;gap:12px}}@media(max-width:720px){.app-header{height:auto}.header-inner{padding:10px 12px;gap:8px}.brand{gap:9px}.brand p{display:none}.header-actions .btn{padding:9px}.market-state{display:none}.layout{padding:8px;min-width:0}.kpi-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.main-grid{grid-template-columns:minmax(0,1fr)}.kpi-grid>*,.main-grid>*,.panel{min-width:0}.order-panel{grid-column:auto}.order-layout{display:block}.chart-shell{height:270px}.kpi{display:block}.kpi-value{margin-top:5px}.panel{padding:10px}.header-actions .btn span{display:none}}
     </style></head><body>
-      <header class="app-header"><div class="header-inner"><div class="brand"><div class="brand-mark">K</div><div><h1>KIS Trading LAB</h1><p>모의투자 데이터 기반 트레이딩 실습 대시보드</p></div></div><div class="header-actions"><div class="market-state">KIS Virtual Connected</div><button class="btn btn-ghost" onclick="load()">↻ <span>전체 갱신</span></button></div></div></header>
+      <header class="app-header"><div class="header-inner"><div class="brand"><div class="brand-mark">K</div><div><h1>KIS Trading LAB</h1><p>모의투자 데이터 기반 트레이딩 실습 대시보드</p></div></div><div class="header-actions"><div class="market-state" id="marketState">KIS 연결 확인 중</div><a class="btn btn-ghost" href="/ui/operations" style="text-decoration:none">운영센터</a><button class="btn btn-ghost" onclick="load()">↻ <span>전체 갱신</span></button></div></div></header>
       <main class="layout">
         <section class="kpi-grid">
           <article class="card kpi"><div class="kpi-label">총 평가금액</div><div class="kpi-value" id="evalAmount">-</div><div class="kpi-note">KIS 모의투자 계좌 기준</div></article>
@@ -356,7 +498,7 @@ def dashboard_ui():
       function showDataTab(tab){holdingsTab.classList.toggle('active',tab==='holdings');ordersTab.classList.toggle('active',tab==='orders');holdingsPane.classList.toggle('active',tab==='holdings');ordersPane.classList.toggle('active',tab==='orders')}
       async function submitMockOrder(){if(!selectedCode){orderStatus.textContent='관심종목을 먼저 선택하세요';return}const quantity=Number(orderQuantity.value),price=Number(orderPrice.value);if(!Number.isInteger(quantity)||quantity<1||!price){orderStatus.textContent='가격과 수량을 확인하세요';return}orderStatus.textContent='모의주문 처리 중...';try{await api('/api/mock-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stock_code:selectedCode,side:orderSide,quantity,price})});orderStatus.textContent=`모의 ${orderSide==='buy'?'매수':'매도'} 주문이 기록되었습니다`;await load()}catch(e){orderStatus.textContent=e.message}}
       function renderTables(){const hs=dashboard.account.holdings||[];holdingCount.textContent=hs.length;holdings.innerHTML=hs.length?hs.map(x=>{const rate=Number(x.profit_loss_rate||0),tone=rate>0?'profit':rate<0?'loss':'neutral';return `<tr><td><strong>${safe(x.stock_name)}</strong><div class="stock-code">${safe(x.stock_code)}</div></td><td class="number">${number(x.quantity)}</td><td class="number">${money(x.average_price)}</td><td class="number">${money(x.evaluation_amount)}</td><td class="number ${tone}">${money(x.profit_loss_amount||0)}</td><td class="number ${tone}">${rate>0?'+':''}${decimal(rate)}%</td></tr>`}).join(''):emptyRow(6,'현재 보유종목이 없습니다');orders.innerHTML=dashboard.orders.length?dashboard.orders.map(x=>`<tr><td>${safe(x.id)}</td><td><strong>${safe(x.stock_name)}</strong><div class="stock-code">${safe(x.stock_code)}</div></td><td><span class="badge side-${safe(x.side)}">모의 ${x.side==='buy'?'매수':'매도'}</span></td><td class="number">${number(x.quantity)}</td><td class="number">${money(x.price)}</td><td><span class="neutral">${safe(x.status)}</span></td></tr>`).join(''):emptyRow(6,'모의주문 내역이 없습니다')}
-      async function load(){lastUpdated.textContent='갱신 중...';try{dashboard=await api('/api/dashboard');evalAmount.innerHTML=`${number(dashboard.account.total_evaluation_amount||0)}<span class="kpi-unit">원</span>`;deposit.innerHTML=`${number(dashboard.account.deposit_amount||0)}<span class="kpi-unit">원</span>`;purchase.innerHTML=`${number(dashboard.account.total_purchase_amount||0)}<span class="kpi-unit">원</span>`;availableAmount.textContent=money(dashboard.account.deposit_amount||0);if(!selectedCode||!dashboard.watchlist.some(x=>x.stock_code===selectedCode))selectedCode=dashboard.watchlist[0]?.stock_code||null;renderWatch();renderTables();lastUpdated.textContent=`${new Date().toLocaleTimeString('ko-KR')} 기준`;if(selectedCode)await selectStock(selectedCode);enrichWatchPrices()}catch(e){lastUpdated.textContent='갱신 실패';watch.innerHTML=`<div class="empty">${safe(e.message)}</div>`}}
+      async function load(){lastUpdated.textContent='갱신 중...';try{dashboard=await api('/api/dashboard');const connected=dashboard.account_available!==false,unit=v=>v===null||v===undefined?'-':`${number(v)}<span class="kpi-unit">원</span>`;evalAmount.innerHTML=unit(dashboard.account.total_evaluation_amount);deposit.innerHTML=unit(dashboard.account.deposit_amount);purchase.innerHTML=unit(dashboard.account.total_purchase_amount);availableAmount.textContent=money(dashboard.account.deposit_amount);marketState.textContent=connected?'KIS Virtual Connected':'KIS 계좌 연결 실패';marketState.style.color=connected?'var(--green)':'var(--amber)';if(!selectedCode||!dashboard.watchlist.some(x=>x.stock_code===selectedCode))selectedCode=dashboard.watchlist[0]?.stock_code||null;renderWatch();renderTables();lastUpdated.textContent=connected?`${new Date().toLocaleTimeString('ko-KR')} 기준`:'계좌 조회 실패 · 로컬 기능 사용 가능';if(selectedCode)await selectStock(selectedCode);enrichWatchPrices()}catch(e){lastUpdated.textContent='대시보드 갱신 실패';watch.innerHTML=`<div class="empty">${safe(e.message)}</div>`;orders.innerHTML=emptyRow(6,'내역을 불러오지 못했습니다')}}
       query.addEventListener('keydown',e=>{if(e.key==='Enter')searchStocks()});window.addEventListener('resize',()=>drawChart());setOrderSide('buy');updateEstimate();load();
     </script></body></html>
     """

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from config import settings
 from lab_repository import SQLiteLabRepository
 from stock_master import normalize_stock_code
 
@@ -81,4 +82,4 @@ def calculate_signal(current_price: int, condition: dict | None):
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "trading_lab.db"
-store = LabStore(SQLiteLabRepository(DEFAULT_DB_PATH))
+store = LabStore(SQLiteLabRepository(DEFAULT_DB_PATH, database_url=settings.DATABASE_URL))

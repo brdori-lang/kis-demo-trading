@@ -1,14 +1,20 @@
 import sqlite3
 from pathlib import Path
 
+from db_connection import PostgresConnection
+
 
 class SQLiteLabRepository:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, database_url: str | None = None):
         self.db_path = str(db_path)
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.database_url = database_url
+        if not self.database_url:
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._create_tables()
 
     def _connect(self):
+        if self.database_url:
+            return PostgresConnection(self.database_url)
         connection = sqlite3.connect(self.db_path, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -26,8 +32,8 @@ class SQLiteLabRepository:
 
                 CREATE TABLE IF NOT EXISTS trading_conditions (
                     stock_code TEXT PRIMARY KEY,
-                    buy_below INTEGER,
-                    sell_above INTEGER,
+                    buy_below BIGINT,
+                    sell_above BIGINT,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (stock_code) REFERENCES watchlist(stock_code)
                         ON DELETE CASCADE
@@ -38,8 +44,8 @@ class SQLiteLabRepository:
                     stock_code TEXT NOT NULL,
                     stock_name TEXT NOT NULL,
                     side TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    price INTEGER NOT NULL,
+                    quantity BIGINT NOT NULL,
+                    price BIGINT NOT NULL,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -54,12 +60,12 @@ class SQLiteLabRepository:
                 CREATE TABLE IF NOT EXISTS daily_prices (
                     stock_code TEXT NOT NULL,
                     trade_date TEXT NOT NULL,
-                    open_price INTEGER NOT NULL,
-                    high_price INTEGER NOT NULL,
-                    low_price INTEGER NOT NULL,
-                    close_price INTEGER NOT NULL,
-                    volume INTEGER NOT NULL,
-                    trading_value INTEGER NOT NULL,
+                    open_price BIGINT NOT NULL,
+                    high_price BIGINT NOT NULL,
+                    low_price BIGINT NOT NULL,
+                    close_price BIGINT NOT NULL,
+                    volume BIGINT NOT NULL,
+                    trading_value BIGINT NOT NULL,
                     fetched_at TEXT NOT NULL,
                     PRIMARY KEY (stock_code, trade_date)
                 );
@@ -172,8 +178,8 @@ class SQLiteLabRepository:
 
     def count_stocks(self):
         with self._connect() as connection:
-            row = connection.execute("SELECT COUNT(*) FROM stock_master").fetchone()
-        return row[0]
+            row = connection.execute("SELECT COUNT(*) AS item_count FROM stock_master").fetchone()
+        return row["item_count"]
 
     def search_stocks(self, query: str, limit: int = 20):
         code_prefix = f"{query}%"

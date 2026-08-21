@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     KIS_APP_SECRET: str
     KIS_ACCOUNT_NO: str
     KIS_ENV: str = "virtual"
+    DATABASE_URL: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

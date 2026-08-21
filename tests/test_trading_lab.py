@@ -103,3 +103,38 @@ def test_dashboard_combines_balance_watchlist_and_orders(monkeypatch):
     assert payload["watchlist"][0]["stock_code"] == "005930"
     assert payload["orders"][0]["side"] == "sell"
     assert client.get("/ui/dashboard").status_code == 200
+
+
+def test_dashboard_keeps_local_features_when_balance_is_unavailable(monkeypatch):
+    monkeypatch.setattr(main_module, "get_current_price", fake_price)
+    monkeypatch.setattr(
+        main_module,
+        "get_account_balance",
+        lambda: (_ for _ in ()).throw(RuntimeError("upstream unavailable")),
+    )
+    client.post("/api/watchlist", json={"stock_code": "005930"})
+    client.post(
+        "/api/mock-orders",
+        json={"stock_code": "005930", "side": "buy", "quantity": 1, "price": 70000},
+    )
+
+    response = client.get("/api/dashboard")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["account_available"] is False
+    assert payload["account"]["holdings"] == []
+    assert payload["watchlist"][0]["stock_code"] == "005930"
+    assert payload["orders"][0]["side"] == "buy"
+    assert "upstream unavailable" not in response.text
+
+
+def test_operations_console_and_job_history_routes():
+    page = client.get("/ui/operations")
+    history = client.get("/api/operations/job-runs")
+
+    assert page.status_code == 200
+    assert "Control Center" in page.text
+    assert "통합 파이프라인 실행" in page.text
+    assert history.status_code == 200
+    assert "items" in history.json()

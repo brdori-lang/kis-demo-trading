@@ -5,3 +5,4 @@ pydantic-settings>=2.7
 httpx>=0.28
 websockets>=14.1
 python-dotenv>=1.0
+psycopg[binary]>=3.2,<4
