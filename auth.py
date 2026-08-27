@@ -4,10 +4,11 @@ import time
 from pathlib import Path
 
 from config import settings
+from security import safe_data_path, validate_outbound_url
 
 
 KIS_VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
-TOKEN_CACHE_FILE = Path(".kis_token_cache.json")
+TOKEN_CACHE_FILE = safe_data_path(".kis_token_cache.json")
 
 
 def _load_token_cache() -> dict:
@@ -24,6 +25,7 @@ def _load_token_cache() -> dict:
 
 def _save_token_cache(token_data: dict) -> None:
     """토큰 정보를 캐시 파일에 저장"""
+    TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(TOKEN_CACHE_FILE, "w") as f:
         json.dump(token_data, f, indent=2)
 
@@ -51,7 +53,7 @@ def _fetch_new_token() -> dict:
     }
 
     response = httpx.post(
-        url,
+        validate_outbound_url(url),
         json=body,
         timeout=10.0,
     )

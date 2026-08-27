@@ -5,6 +5,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from security import validate_outbound_url
+
 
 KOSPI_MASTER_URL = "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip"
 KOSDAQ_MASTER_URL = "https://new.real.download.dws.co.kr/common/master/kosdaq_code.mst.zip"
@@ -60,6 +62,9 @@ def parse_kosdaq_master(lines):
 
 
 def _download_and_parse(url: str, archive_name: str, member_name: str, parser):
+    validate_outbound_url(url)
+    if Path(archive_name).name != archive_name or Path(member_name).name != member_name:
+        raise ValueError("unsafe stock master filename")
     with tempfile.TemporaryDirectory(prefix="kis-stock-master-") as temp_dir:
         archive_path = Path(temp_dir) / archive_name
         urllib.request.urlretrieve(url, archive_path)

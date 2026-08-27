@@ -4,6 +4,7 @@ import time
 
 from auth import get_access_token
 from config import settings
+from security import validate_outbound_url
 
 
 KIS_VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
@@ -13,6 +14,7 @@ _last_request_at = 0.0
 
 
 def _kis_get(url: str, headers: dict, params: dict):
+    url = validate_outbound_url(url)
     global _last_request_at
     with _request_lock:
         wait_seconds = _REQUEST_INTERVAL_SECONDS - (time.monotonic() - _last_request_at)

@@ -8,9 +8,9 @@ _REQUIRED_INDICATORS = ("sma_5", "sma_20", "rsi_14", "volume_ratio")
 
 def run_backtest(bars: list[dict], initial_cash: int = INITIAL_CASH):
     """Run LAB Strategy v1 without any external I/O or real order calls."""
+    if type(initial_cash) is not int or not 1 <= initial_cash <= 1_000_000_000_000:
+        raise ValueError("initial_cash must be a bounded integer")
     ordered_bars = _validate_and_order_bars(bars)
-    if initial_cash <= 0:
-        raise ValueError("initial_cash must be positive")
 
     evaluation_start_index = _find_evaluation_start(ordered_bars)
     if evaluation_start_index is None:

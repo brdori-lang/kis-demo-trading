@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from indicators import calculate_technical_indicators
 from kis_api import get_account_balance, get_current_price
@@ -13,35 +15,41 @@ from trading_lab import calculate_signal, search_stocks, stock_name, store
 
 app = FastAPI(title="KIS Open API LAB")
 
+StockCode = Annotated[str, Field(pattern=r"^\d{6}$")]
 
-class WatchRequest(BaseModel):
+
+class SecureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, allow_inf_nan=False)
+
+
+class WatchRequest(SecureRequest):
     stock_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
-class ConditionRequest(BaseModel):
+class ConditionRequest(SecureRequest):
     stock_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
-    buy_below: int | None = None
-    sell_above: int | None = None
+    buy_below: int | None = Field(default=None, gt=0, le=10_000_000)
+    sell_above: int | None = Field(default=None, gt=0, le=10_000_000)
 
 
-class MockOrderRequest(BaseModel):
+class MockOrderRequest(SecureRequest):
     stock_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
-    side: str
-    quantity: int
-    price: int | None = None
+    side: str = Field(pattern=r"^(buy|sell)$")
+    quantity: int = Field(le=1_000_000)
+    price: int | None = Field(default=None, le=10_000_000)
 
 
-class OperationSettingsRequest(BaseModel):
+class OperationSettingsRequest(SecureRequest):
     automation_enabled: bool | None = None
     dry_run: bool | None = None
     max_positions: int | None = Field(default=None, ge=1, le=50)
     max_order_amount: int | None = Field(default=None, ge=10_000)
     stop_loss_rate: float | None = Field(default=None, gt=0, le=100)
     take_profit_rate: float | None = Field(default=None, gt=0, le=1000)
-    analysis_schedule: str | None = None
+    analysis_schedule: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
-class UniverseSettingsRequest(BaseModel):
+class UniverseSettingsRequest(SecureRequest):
     enabled: bool | None = None
     strategy_name: str | None = Field(default=None, min_length=1, max_length=100)
     target_weight: float | None = Field(default=None, gt=0, le=100)
@@ -128,7 +136,7 @@ def account_balance_ui():
 
 
 @app.get("/api/price/{stock_code}")
-def current_price(stock_code: str):
+def current_price(stock_code: StockCode):
     try:
         result = get_current_price(stock_code)
         output = result.get("output", {})
@@ -198,13 +206,13 @@ def _price_for(stock_code: str):
 
 
 @app.get("/api/stocks/search")
-def stock_search(q: str):
+def stock_search(q: Annotated[str, Query(min_length=1, max_length=100)]):
     return {"items": search_stocks(q)}
 
 
 @app.get("/api/stocks/{stock_code}/daily")
 def daily_prices(
-    stock_code: str,
+    stock_code: StockCode,
     days: int = Query(default=100, ge=1, le=100),
     refresh: bool = False,
 ):
@@ -219,7 +227,7 @@ def daily_prices(
 
 @app.get("/api/stocks/{stock_code}/indicators")
 def technical_indicators(
-    stock_code: str,
+    stock_code: StockCode,
     recent: int = Query(default=20, ge=1, le=100),
 ):
     try:
@@ -241,7 +249,7 @@ def technical_indicators(
 
 
 @app.get("/api/stocks/{stock_code}/strategy")
-def lab_strategy(stock_code: str):
+def lab_strategy(stock_code: StockCode):
     try:
         service = DailyMarketDataService(store.repository)
         market_data = service.get_daily_prices(stock_code, days=100)
@@ -286,7 +294,7 @@ def set_condition(payload: ConditionRequest):
 
 
 @app.get("/api/signals/{stock_code}")
-def get_signal(stock_code: str):
+def get_signal(stock_code: StockCode):
     try:
         current = _price_for(stock_code)
         condition = store.get_condition(stock_code)
@@ -364,7 +372,7 @@ def operation_universe():
 
 
 @app.put("/api/operations/universe/{stock_code}")
-def update_operation_universe(stock_code: str, payload: UniverseSettingsRequest):
+def update_operation_universe(stock_code: StockCode, payload: UniverseSettingsRequest):
     try:
         return operations_service().update_universe(
             store, stock_code, payload.model_dump(exclude_none=True)
