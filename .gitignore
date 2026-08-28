@@ -6,3 +6,5 @@ __pycache__/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/.kis_token_cache.json
+data/*.log
