@@ -4,16 +4,18 @@ import time
 
 from auth import get_access_token
 from config import settings
+from kis_safety import KIS_VTS_REST_BASE_URL, require_virtual_environment, require_vts_rest_url
 from security import validate_outbound_url
 
 
-KIS_VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
+KIS_VIRTUAL_DOMAIN = KIS_VTS_REST_BASE_URL
 _REQUEST_INTERVAL_SECONDS = 1.05
 _request_lock = threading.Lock()
 _last_request_at = 0.0
 
 
 def _kis_get(url: str, headers: dict, params: dict):
+    require_vts_rest_url(url)
     url = validate_outbound_url(url)
     global _last_request_at
     with _request_lock:
@@ -44,6 +46,7 @@ def _parse_account_info(account_no: str):
 
 
 def get_current_price(stock_code: str):
+    require_virtual_environment()
     access_token = get_access_token()
 
     url = f"{KIS_VIRTUAL_DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-price"
@@ -71,6 +74,7 @@ def get_current_price(stock_code: str):
 
 
 def get_account_balance():
+    require_virtual_environment()
     access_token = get_access_token()
 
     account_no = (settings.KIS_ACCOUNT_NO or "").strip()
@@ -81,7 +85,7 @@ def get_account_balance():
 
     url = f"{KIS_VIRTUAL_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-balance"
 
-    tr_id = "VTTC8434R" if (settings.KIS_ENV or "").lower() == "virtual" else "TTTC8434R"
+    tr_id = "VTTC8434R"
 
     headers = {
         "Content-Type": "application/json",
@@ -118,6 +122,7 @@ def get_account_balance():
 
 
 def get_daily_item_chart_price(stock_code: str, start_date: str, end_date: str):
+    require_virtual_environment()
     access_token = get_access_token()
     url = f"{KIS_VIRTUAL_DOMAIN}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
     headers = {

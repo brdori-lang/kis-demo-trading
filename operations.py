@@ -351,9 +351,13 @@ class OperationsService:
         return [dict(row) for row in rows]
 
     def overview(self, store):
+        from config import settings as app_settings
+        from kis_virtual_orders import KISOrderStore
+
         signals = self.list_signals()
         backtests = self.list_backtests(100)
         orders = store.list_orders()
+        reconciliation_runs = KISOrderStore(self.repository).reconciliation_runs(1)
         return {
             "watchlist_count": len(store.list_watch()),
             "signal_count": len(signals),
@@ -364,4 +368,11 @@ class OperationsService:
             "automation": self.get_settings(),
             "latest_jobs": self.list_jobs(),
             "data_status": self.data_status(store),
+            "order_safety": {
+                "environment": "KIS_VIRTUAL",
+                "real_orders": "BLOCKED",
+                "paper_order_enabled": app_settings.PAPER_ORDER_ENABLED,
+                "vts_submit_enabled": app_settings.KIS_VIRTUAL_ORDER_SUBMIT_ENABLED,
+            },
+            "latest_reconciliation": reconciliation_runs[0] if reconciliation_runs else None,
         }

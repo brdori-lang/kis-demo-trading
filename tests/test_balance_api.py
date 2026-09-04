@@ -10,7 +10,7 @@ client = TestClient(main_module.app)
 
 def test_current_price_route_still_works(monkeypatch):
     def fake_get_current_price(stock_code: str):
-        return {"output": {"stck_prpr": "50000"}}
+        return {"output": {"stck_prpr": "50000", "prdy_vrss": "1200", "prdy_ctrt": "2.46"}}
 
     monkeypatch.setattr(main_module, "get_current_price", fake_get_current_price)
 
@@ -19,6 +19,29 @@ def test_current_price_route_still_works(monkeypatch):
     assert response.status_code == 200
     assert response.json()["stock_code"] == "005930"
     assert response.json()["current_price"] == "50000"
+    assert response.json()["change"] == "1200"
+    assert response.json()["change_rate"] == "2.46"
+
+
+def test_dashboard_uses_declared_price_contract():
+    page = client.get("/ui/dashboard")
+
+    assert page.status_code == 200
+    assert "p.current_price" in page.text
+    assert "p.change_rate" in page.text
+    assert "price?.change" in page.text
+    assert "price?.change_rate" in page.text
+    assert "p.output" not in page.text
+
+
+def test_account_balance_ui_is_utf8_korean():
+    response = client.get("/ui/account-balance")
+
+    assert response.status_code == 200
+    assert "charset=utf-8" in response.headers["content-type"].lower()
+    assert "KIS 계좌 잔고" in response.text
+    assert "총 평가금액" in response.text
+    assert "보유종목이 없습니다." in response.text
 
 
 def test_balance_route_exists_and_returns_json(monkeypatch):

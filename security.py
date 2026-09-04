@@ -10,7 +10,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = (PROJECT_ROOT / "data").resolve()
 KIS_ALLOWED_HOSTS = {
     "openapivts.koreainvestment.com",
-    "openapi.koreainvestment.com",
     "new.real.download.dws.co.kr",
 }
 

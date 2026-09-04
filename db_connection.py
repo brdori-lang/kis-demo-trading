@@ -14,7 +14,11 @@ class PostgresCursor:
 
 
 class PostgresConnection:
-    _serial_tables = {"mock_orders", "backtest_runs", "job_runs", "system_logs"}
+    _serial_tables = {
+        "mock_orders", "backtest_runs", "job_runs", "system_logs",
+        "kis_order_events", "kis_order_executions", "kis_reconciliation_runs",
+        "kis_reconciliation_items",
+    }
 
     def __init__(self, database_url):
         import psycopg

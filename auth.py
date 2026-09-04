@@ -4,10 +4,11 @@ import time
 from pathlib import Path
 
 from config import settings
+from kis_safety import KIS_VTS_REST_BASE_URL, require_virtual_environment, require_vts_rest_url
 from security import safe_data_path, validate_outbound_url
 
 
-KIS_VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
+KIS_VIRTUAL_DOMAIN = KIS_VTS_REST_BASE_URL
 TOKEN_CACHE_FILE = safe_data_path(".kis_token_cache.json")
 
 
@@ -44,7 +45,9 @@ def _is_token_valid(cache_data: dict) -> bool:
 
 def _fetch_new_token() -> dict:
     """KIS API에서 새로운 토큰 발급"""
+    require_virtual_environment()
     url = f"{KIS_VIRTUAL_DOMAIN}/oauth2/tokenP"
+    require_vts_rest_url(url)
 
     body = {
         "grant_type": "client_credentials",

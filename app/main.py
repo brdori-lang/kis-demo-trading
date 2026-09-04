@@ -1,13 +1,17 @@
-from fastapi import FastAPI, HTTPException, Query
+import asyncio
+
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from indicators import calculate_technical_indicators
 from kis_api import get_account_balance, get_current_price
 from market_data import DailyMarketDataService
+from kis_virtual_orders import DuplicateOrderError, KISVirtualOrderService, OrderSafetyError
 from operations import JOB_DEFINITIONS, OperationsService
+from realtime_quotes import RealtimeQuoteService
 from app.operations_ui import render_operations_ui
 from strategy_engine import evaluate_lab_strategy_v1
 from trading_lab import calculate_signal, search_stocks, stock_name, store
@@ -55,8 +59,54 @@ class UniverseSettingsRequest(SecureRequest):
     target_weight: float | None = Field(default=None, gt=0, le=100)
 
 
+class KISVirtualOrderRequest(SecureRequest):
+    idempotency_key: str = Field(min_length=8, max_length=100)
+    stock_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    side: Literal["BUY", "SELL"]
+    quantity: int = Field(gt=0)
+    price: int = Field(ge=0)
+    order_type: Literal["LIMIT", "MARKET"]
+    execution_mode: Literal["KIS_VIRTUAL"] = "KIS_VIRTUAL"
+
+
+class CurrentPriceResponse(BaseModel):
+    stock_code: str
+    current_price: str | None = None
+    change: str | None = None
+    change_rate: str | None = None
+
+
+class HoldingResponse(BaseModel):
+    stock_code: str | None = None
+    stock_name: str | None = None
+    quantity: str | None = None
+    average_price: str | None = None
+    evaluation_amount: str | None = None
+    profit_loss_amount: str | None = None
+    profit_loss_rate: str | None = None
+
+
+class AccountBalanceResponse(BaseModel):
+    total_evaluation_amount: str | None = None
+    total_purchase_amount: str | None = None
+    deposit_amount: str | None = None
+    holdings: list[HoldingResponse]
+
+
+class DashboardResponse(BaseModel):
+    account: AccountBalanceResponse
+    account_available: bool
+    account_error: str | None = None
+    watchlist: list[dict[str, Any]]
+    orders: list[dict[str, Any]]
+
+
 def operations_service():
     return OperationsService(store.repository)
+
+
+def kis_order_service():
+    return KISVirtualOrderService(store.repository)
 
 
 @app.get("/")
@@ -135,17 +185,22 @@ def account_balance_ui():
     """
 
 
-@app.get("/api/price/{stock_code}")
+@app.get("/api/price/{stock_code}", response_model=CurrentPriceResponse)
 def current_price(stock_code: StockCode):
     try:
         result = get_current_price(stock_code)
         output = result.get("output", {})
-        return {"stock_code": stock_code, "current_price": output.get("stck_prpr")}
+        return {
+            "stock_code": stock_code,
+            "current_price": output.get("stck_prpr"),
+            "change": output.get("prdy_vrss"),
+            "change_rate": output.get("prdy_ctrt"),
+        }
     except Exception:
         raise HTTPException(status_code=502, detail="현재가 조회에 실패했습니다.") from None
 
 
-@app.get("/api/account/balance")
+@app.get("/api/account/balance", response_model=AccountBalanceResponse)
 def account_balance():
     try:
         result = get_account_balance()
@@ -319,7 +374,77 @@ def get_mock_orders():
     return {"orders": store.list_orders()}
 
 
-@app.get("/api/dashboard")
+@app.post("/api/kis/orders/preview")
+def preview_kis_virtual_order(payload: KISVirtualOrderRequest):
+    try:
+        return {"preview": kis_order_service().preview(payload.model_dump())}
+    except (ValueError, OrderSafetyError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+
+@app.post("/api/kis/orders")
+def submit_kis_virtual_order(payload: KISVirtualOrderRequest):
+    try:
+        return {"order": kis_order_service().submit(payload.model_dump())}
+    except OrderSafetyError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from None
+    except DuplicateOrderError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    except Exception:
+        raise HTTPException(status_code=502, detail="KIS VTS 주문 제출에 실패했습니다.") from None
+
+
+@app.get("/api/kis/orders")
+def list_kis_virtual_orders():
+    return {"orders": kis_order_service().store.list()}
+
+
+@app.get("/api/kis/orders/{order_id}/events")
+def list_kis_virtual_order_events(order_id: str):
+    return {"events": kis_order_service().store.events(order_id)}
+
+
+@app.get("/api/kis/orders/{order_id}/executions")
+def list_kis_virtual_order_executions(order_id: str):
+    return {"executions": kis_order_service().store.executions(order_id)}
+
+
+@app.post("/api/kis/orders/refresh")
+def refresh_kis_virtual_orders():
+    try:
+        return {"orders": kis_order_service().refresh()}
+    except Exception:
+        raise HTTPException(status_code=502, detail="KIS VTS 주문 조회에 실패했습니다.") from None
+
+
+@app.post("/api/kis/orders/{order_id}/cancel")
+def cancel_kis_virtual_order(order_id: str):
+    try:
+        return {"order": kis_order_service().cancel(order_id)}
+    except OrderSafetyError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from None
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    except Exception:
+        raise HTTPException(status_code=502, detail="KIS VTS 주문 취소에 실패했습니다.") from None
+
+
+@app.post("/api/kis/reconcile")
+def reconcile_kis_virtual_orders():
+    try:
+        return {"reconciliation": kis_order_service().reconcile()}
+    except Exception:
+        raise HTTPException(status_code=502, detail="KIS VTS 정합성 검증에 실패했습니다.") from None
+
+
+@app.get("/api/kis/reconciliations")
+def list_kis_reconciliations(limit: int = Query(default=20, ge=1, le=100)):
+    return {"reconciliations": kis_order_service().store.reconciliation_runs(limit)}
+
+
+@app.get("/api/dashboard", response_model=DashboardResponse)
 def dashboard_data():
     account_error = None
     try:
@@ -418,6 +543,39 @@ def operation_logs(limit: int = Query(default=100, ge=1, le=500)):
     return {"items": operations_service().list_logs(limit)}
 
 
+@app.websocket("/ws/quotes")
+async def realtime_quotes(websocket: WebSocket):
+    await websocket.accept()
+    outgoing: asyncio.Queue[dict] = asyncio.Queue()
+    service = RealtimeQuoteService()
+
+    async def publish(event: dict):
+        await outgoing.put(event)
+
+    async def send_events():
+        while True:
+            await websocket.send_json(await outgoing.get())
+
+    await service.start(publish)
+    sender = asyncio.create_task(send_events())
+    try:
+        while True:
+            request = await websocket.receive_json()
+            action = request.get("action")
+            stock_code = request.get("stock_code", "")
+            if action == "subscribe":
+                await service.subscribe(stock_code)
+            elif action == "unsubscribe":
+                await service.unsubscribe(stock_code)
+            else:
+                await websocket.send_json({"type": "error", "message": "지원하지 않는 실시간 명령입니다."})
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        sender.cancel()
+        await service.stop()
+
+
 @app.get("/ui/operations", response_class=HTMLResponse)
 def operations_ui():
     return render_operations_ui()
@@ -478,14 +636,14 @@ def dashboard_ui():
           <article class="panel"><div class="panel-title"><div><div class="eyebrow">Market Overview</div><h2>선택 종목 상세</h2></div><span class="subtle" id="indicatorDate">-</span></div>
             <div id="stockDetail"><div class="empty">관심종목에서 종목을 선택하세요</div></div>
           </article>
-          <article class="panel order-panel"><div class="panel-title"><div><div class="eyebrow">Paper Trading</div><h2>모의주문</h2></div></div>
-            <div class="paper-label">실제 주문이 전송되지 않습니다</div><div class="ticket-tabs"><button id="buyTab" class="ticket-tab active buy" onclick="setOrderSide('buy')">매수</button><button id="sellTab" class="ticket-tab" onclick="setOrderSide('sell')">매도</button></div><div class="order-reference"><div><span>선택 종목</span><strong id="orderStock">-</strong></div><div><span>현재가</span><strong id="orderCurrent">-</strong></div><div><span>주문가능금액 참고</span><strong id="availableAmount">-</strong></div></div>
-            <div class="form-group"><label class="form-label" for="orderPrice"><span>주문가격</span><span>KRW</span></label><input class="field" id="orderPrice" type="number" min="1" placeholder="현재가" oninput="updateEstimate()"/></div><div class="form-group"><label class="form-label" for="orderQuantity"><span>수량</span><span>주</span></label><input class="field" id="orderQuantity" type="number" min="1" value="1" oninput="updateEstimate()"/></div><div class="estimated"><span>예상 주문금액</span><strong id="estimatedAmount">-</strong></div><button id="orderSubmit" class="btn btn-buy btn-block" style="margin-top:9px" onclick="submitMockOrder()">모의 매수 주문</button><div class="status-line" id="orderStatus"></div><p class="order-warning">LAB 기록용 모의체결입니다. KIS 실제 주문 API를 호출하지 않습니다.</p>
+          <article class="panel order-panel"><div class="panel-title"><div><div class="eyebrow">LOCAL MOCK</div><h2>교육용 모의주문</h2></div></div>
+            <div class="paper-label">LOCAL MOCK · 로컬 DB에만 기록</div><div class="paper-label" style="background:#10251f;border-color:#285141;color:#7ce3c1">KIS VIRTUAL · 한국투자증권 모의투자 · 기본 차단</div><div class="ticket-tabs"><button id="buyTab" class="ticket-tab active buy" onclick="setOrderSide('buy')">매수</button><button id="sellTab" class="ticket-tab" onclick="setOrderSide('sell')">매도</button></div><div class="order-reference"><div><span>선택 종목</span><strong id="orderStock">-</strong></div><div><span>현재가</span><strong id="orderCurrent">-</strong></div><div><span>주문가능금액 참고</span><strong id="availableAmount">-</strong></div></div>
+            <div class="form-group"><label class="form-label" for="orderPrice"><span>주문가격</span><span>KRW</span></label><input class="field" id="orderPrice" type="number" min="1" placeholder="현재가" oninput="updateEstimate()"/></div><div class="form-group"><label class="form-label" for="orderQuantity"><span>수량</span><span>주</span></label><input class="field" id="orderQuantity" type="number" min="1" value="1" oninput="updateEstimate()"/></div><div class="estimated"><span>예상 주문금액</span><strong id="estimatedAmount">-</strong></div><button id="orderSubmit" class="btn btn-buy btn-block" style="margin-top:9px" onclick="submitMockOrder()">모의 매수 주문</button><div class="status-line" id="orderStatus"></div><p class="order-warning">LOCAL MOCK은 KIS로 전송되지 않습니다. KIS VIRTUAL 주문은 별도 API와 이중 safety flag를 사용하며, 실전주문은 항상 BLOCKED입니다.</p>
           </article>
         </section>
         <section class="bottom-grid"><article class="panel table-panel"><div class="table-head"><div class="data-tabs"><button id="holdingsTab" class="data-tab active" onclick="showDataTab('holdings')">보유종목</button><button id="ordersTab" class="data-tab" onclick="showDataTab('orders')">모의주문 내역</button></div></div><div id="holdingsPane" class="table-pane active table-wrap"><table><thead><tr><th>종목</th><th class="number">수량</th><th class="number">평균단가</th><th class="number">평가금액</th><th class="number">손익금액</th><th class="number">손익률</th></tr></thead><tbody id="holdings"><tr><td colspan="6" class="neutral">불러오는 중</td></tr></tbody></table></div><div id="ordersPane" class="table-pane table-wrap"><table><thead><tr><th>ID</th><th>종목</th><th>구분</th><th class="number">수량</th><th class="number">가격</th><th>상태</th></tr></thead><tbody id="orders"><tr><td colspan="6" class="neutral">불러오는 중</td></tr></tbody></table></div></article></section>
       </main><script>
-      let dashboard=null,selectedCode=null,orderSide='buy',chartPayload=null;
+      let dashboard=null,selectedCode=null,orderSide='buy',chartPayload=null,quoteSocket=null,realtimeCode=null,reconnectTimer=null;
       const api=(url,opt)=>fetch(url,opt).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.detail||'요청에 실패했습니다');return d});
       const money=v=>v===null||v===undefined||v===''?'-':`${Number(v).toLocaleString('ko-KR')}원`;
       const number=v=>v===null||v===undefined?'-':Number(v).toLocaleString('ko-KR');
@@ -493,12 +651,15 @@ def dashboard_ui():
       const safe=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
       const badge=s=>`<span class="badge ${safe(s||'UNAVAILABLE')}">${safe(s||'UNAVAILABLE')}</span>`;
       const emptyRow=(cols,text)=>`<tr><td colspan="${cols}" class="neutral">${text}</td></tr>`;
+      function connectQuotes(){clearTimeout(reconnectTimer);const protocol=location.protocol==='https:'?'wss:':'ws:';quoteSocket=new WebSocket(`${protocol}//${location.host}/ws/quotes`);quoteSocket.onopen=()=>{marketState.textContent='KIS 실시간 연결 중';if(selectedCode)subscribeRealtime(selectedCode)};quoteSocket.onmessage=e=>{const event=JSON.parse(e.data);if(event.type==='connection'){marketState.textContent=event.state==='connected'?'KIS VTS Realtime Connected':event.state==='reconnecting'?'KIS 실시간 재연결 중':'KIS 실시간 연결 중';marketState.style.color=event.state==='connected'?'var(--green)':'var(--amber)';if(event.state==='connected'&&selectedCode)subscribeRealtime(selectedCode)}else if(event.type==='quote'){applyRealtimeQuote(event)}};quoteSocket.onclose=()=>{marketState.textContent='KIS 실시간 재연결 대기';marketState.style.color='var(--amber)';realtimeCode=null;reconnectTimer=setTimeout(connectQuotes,2000)}}
+      function subscribeRealtime(code){if(!quoteSocket||quoteSocket.readyState!==WebSocket.OPEN)return;if(realtimeCode&&realtimeCode!==code)quoteSocket.send(JSON.stringify({action:'unsubscribe',stock_code:realtimeCode}));realtimeCode=code;quoteSocket.send(JSON.stringify({action:'subscribe',stock_code:code}))}
+      function applyRealtimeQuote(q){const item=dashboard?.watchlist.find(x=>x.stock_code===q.stock_code);if(!item)return;const current=Number(q.current_price),change=Number(q.change),rate=Number(q.change_rate);if(Number.isFinite(current)&&current>0)item.current_price=current;if(Number.isFinite(rate))item.changeRate=rate;renderWatch();if(selectedCode!==q.stock_code)return;orderCurrent.textContent=money(current);const priceEl=document.querySelector('.hero-price strong'),changeEl=document.querySelector('.hero-price .price-change');if(priceEl)priceEl.textContent=money(current);if(changeEl){changeEl.className=`price-change ${tone(change)}`;changeEl.textContent=`${change>0?'+':''}${number(change)} (${rate>0?'+':''}${decimal(rate)}%)`}}
       async function searchStocks(){const q=query.value.trim();if(!q)return;results.innerHTML='<option>검색 중...</option>';try{const d=await api('/api/stocks/search?q='+encodeURIComponent(q));results.innerHTML=d.items.length?d.items.map(x=>`<option value="${safe(x.stock_code)}">${safe(x.stock_name)} (${safe(x.stock_code)})</option>`).join(''):'<option value="">검색 결과가 없습니다</option>'}catch(e){results.innerHTML='<option value="">검색에 실패했습니다</option>'}}
       async function addWatch(){if(!results.value)return;await api('/api/watchlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stock_code:results.value})});selectedCode=results.value;await load()}
       function tone(v){return Number(v)>0?'profit':Number(v)<0?'loss':'neutral'}
-      function renderWatch(){watchCount.textContent=`${dashboard.watchlist.length}종목`;watch.innerHTML=dashboard.watchlist.length?dashboard.watchlist.map(x=>{const validRate=Number.isFinite(x.changeRate);return `<div class="watch-item ${x.stock_code===selectedCode?'active':''}" onclick="selectStock('${safe(x.stock_code)}')"><div><div class="stock-name">${safe(x.stock_name)}</div><div class="stock-code">${safe(x.stock_code)}</div></div><div class="watch-price">${number(x.current_price)}</div><div class="watch-change ${validRate?tone(x.changeRate):'neutral'}">${validRate?`${x.changeRate>0?'+':''}${decimal(x.changeRate)}%`:'-'}</div><div class="number">${badge(x.signal)}</div></div>`}).join(''):'<div class="empty">등록된 관심종목이 없습니다</div>'}
-      async function enrichWatchPrices(){for(const item of dashboard.watchlist){try{const p=await api(`/api/price/${item.stock_code}`),o=p.output||{},current=Number(o.stck_prpr),rate=o.prdy_ctrt===''?NaN:Number(o.prdy_ctrt);if(Number.isFinite(current)&&current>0)item.current_price=current;if(Number.isFinite(rate)){item.changeRate=rate}else{const daily=await api(`/api/stocks/${item.stock_code}/daily?days=2`),previous=daily.items.length>1?Number(daily.items[daily.items.length-2].close_price):NaN;item.changeRate=Number.isFinite(previous)&&previous?(item.current_price-previous)/previous*100:undefined}}catch(e){item.changeRate=undefined}renderWatch()}}
-      async function selectStock(code){selectedCode=code;renderWatch();const item=dashboard.watchlist.find(x=>x.stock_code===code);orderStock.textContent=item?`${item.stock_name} · ${item.stock_code}`:code;orderCurrent.textContent=money(item?.current_price);orderPrice.value=item?.current_price||'';updateEstimate();stockDetail.innerHTML='<div class="empty loading">100일 시세와 지표를 불러오는 중입니다</div>';try{const [daily,ind,strategy,price]=await Promise.all([api(`/api/stocks/${code}/daily?days=100`),api(`/api/stocks/${code}/indicators?recent=100`),api(`/api/stocks/${code}/strategy`),api(`/api/price/${code}`).catch(()=>null)]);const latest=ind.latest||{},live=price?.output||{},current=Number(live.stck_prpr||item?.current_price||0),liveChange=live.prdy_vrss===''?NaN:Number(live.prdy_vrss),liveRate=live.prdy_ctrt===''?NaN:Number(live.prdy_ctrt),previous=daily.items.length>1?Number(daily.items[daily.items.length-2].close_price):null,change=Number.isFinite(liveChange)?liveChange:Number.isFinite(previous)?current-previous:null,rate=Number.isFinite(liveRate)?liveRate:Number.isFinite(previous)&&previous?change/previous*100:null,changeText=rate===null?'-':`${change>0?'+':''}${number(change)} (${rate>0?'+':''}${decimal(rate)}%)`;if(item){item.current_price=current;if(rate!==null)item.changeRate=rate}orderCurrent.textContent=money(current);orderPrice.value=current||'';updateEstimate();indicatorDate.textContent=ind.as_of_date?`${ind.as_of_date.slice(0,4)}.${ind.as_of_date.slice(4,6)}.${ind.as_of_date.slice(6)}`:'-';stockDetail.innerHTML=`<div class="detail-head"><div><div class="selected-name">${safe(item?.stock_name||code)}</div><div class="selected-code">KRX · ${safe(code)} · 일봉 100</div></div><div class="hero-price"><strong>${money(current)}</strong><span class="price-change ${tone(change)}">${changeText}</span></div></div><div class="chart-toolbar"><div class="legend"><span class="sma5">SMA5</span><span class="sma20">SMA20</span></div><span>수정주가 · 일봉</span></div><div class="chart-shell"><canvas id="priceChart"></canvas></div><div class="indicator-strip"><div class="indicator-compact"><span>RSI 14</span><strong>${decimal(latest.rsi_14)}</strong></div><div class="meter"><i style="width:${Math.max(0,Math.min(100,Number(latest.rsi_14||0)))}%"></i></div><div class="indicator-compact number"><span>VOLUME RATIO</span><strong>${decimal(latest.volume_ratio)}x</strong></div></div><div class="strategy-line"><div><div class="eyebrow">LAB Strategy v1</div><span class="subtle">최근 지표 기준</span></div>${badge(strategy.signal)}</div><details class="condition-box"><summary>Legacy 가격조건 Signal 설정</summary><div class="condition-fields"><input class="field" id="buyCondition" type="number" placeholder="매수 기준가"/><input class="field" id="sellCondition" type="number" placeholder="매도 기준가"/><button class="btn btn-ghost" onclick="saveCondition()">저장</button></div></details>`;chartPayload={bars:daily.items,indicators:ind.items};drawChart();renderWatch()}catch(e){stockDetail.innerHTML=`<div class="empty">상세 데이터를 불러오지 못했습니다<br><span class="subtle">${safe(e.message)}</span></div>`}}
+      function renderWatch(){watchCount.textContent=`${dashboard.watchlist.length}종목`;watch.innerHTML=dashboard.watchlist.length?dashboard.watchlist.map(x=>{const validRate=Number.isFinite(x.changeRate);return `<div class="watch-item ${x.stock_code===selectedCode?'active':''}" onclick="subscribeRealtime('${safe(x.stock_code)}');selectStock('${safe(x.stock_code)}')"><div><div class="stock-name">${safe(x.stock_name)}</div><div class="stock-code">${safe(x.stock_code)}</div></div><div class="watch-price">${number(x.current_price)}</div><div class="watch-change ${validRate?tone(x.changeRate):'neutral'}">${validRate?`${x.changeRate>0?'+':''}${decimal(x.changeRate)}%`:'-'}</div><div class="number">${badge(x.signal)}</div></div>`}).join(''):'<div class="empty">등록된 관심종목이 없습니다</div>'}
+      async function enrichWatchPrices(){for(const item of dashboard.watchlist){try{const p=await api(`/api/price/${item.stock_code}`),current=Number(p.current_price),rate=p.change_rate===''?NaN:Number(p.change_rate);if(Number.isFinite(current)&&current>0)item.current_price=current;if(Number.isFinite(rate)){item.changeRate=rate}else{const daily=await api(`/api/stocks/${item.stock_code}/daily?days=2`),previous=daily.items.length>1?Number(daily.items[daily.items.length-2].close_price):NaN;item.changeRate=Number.isFinite(previous)&&previous?(item.current_price-previous)/previous*100:undefined}}catch(e){item.changeRate=undefined}renderWatch()}}
+      async function selectStock(code){selectedCode=code;renderWatch();const item=dashboard.watchlist.find(x=>x.stock_code===code);orderStock.textContent=item?`${item.stock_name} · ${item.stock_code}`:code;orderCurrent.textContent=money(item?.current_price);orderPrice.value=item?.current_price||'';updateEstimate();stockDetail.innerHTML='<div class="empty loading">100일 시세와 지표를 불러오는 중입니다</div>';try{const [daily,ind,strategy,price]=await Promise.all([api(`/api/stocks/${code}/daily?days=100`),api(`/api/stocks/${code}/indicators?recent=100`),api(`/api/stocks/${code}/strategy`),api(`/api/price/${code}`).catch(()=>null)]);const latest=ind.latest||{},current=Number(price?.current_price||item?.current_price||0),liveChange=price?.change===''?NaN:Number(price?.change),liveRate=price?.change_rate===''?NaN:Number(price?.change_rate),previous=daily.items.length>1?Number(daily.items[daily.items.length-2].close_price):null,change=Number.isFinite(liveChange)?liveChange:Number.isFinite(previous)?current-previous:null,rate=Number.isFinite(liveRate)?liveRate:Number.isFinite(previous)&&previous?change/previous*100:null,changeText=rate===null?'-':`${change>0?'+':''}${number(change)} (${rate>0?'+':''}${decimal(rate)}%)`;if(item){item.current_price=current;if(rate!==null)item.changeRate=rate}orderCurrent.textContent=money(current);orderPrice.value=current||'';updateEstimate();indicatorDate.textContent=ind.as_of_date?`${ind.as_of_date.slice(0,4)}.${ind.as_of_date.slice(4,6)}.${ind.as_of_date.slice(6)}`:'-';stockDetail.innerHTML=`<div class="detail-head"><div><div class="selected-name">${safe(item?.stock_name||code)}</div><div class="selected-code">KRX · ${safe(code)} · 일봉 100</div></div><div class="hero-price"><strong>${money(current)}</strong><span class="price-change ${tone(change)}">${changeText}</span></div></div><div class="chart-toolbar"><div class="legend"><span class="sma5">SMA5</span><span class="sma20">SMA20</span></div><span>수정주가 · 일봉</span></div><div class="chart-shell"><canvas id="priceChart"></canvas></div><div class="indicator-strip"><div class="indicator-compact"><span>RSI 14</span><strong>${decimal(latest.rsi_14)}</strong></div><div class="meter"><i style="width:${Math.max(0,Math.min(100,Number(latest.rsi_14||0)))}%"></i></div><div class="indicator-compact number"><span>VOLUME RATIO</span><strong>${decimal(latest.volume_ratio)}x</strong></div></div><div class="strategy-line"><div><div class="eyebrow">LAB Strategy v1</div><span class="subtle">최근 지표 기준</span></div>${badge(strategy.signal)}</div><details class="condition-box"><summary>Legacy 가격조건 Signal 설정</summary><div class="condition-fields"><input class="field" id="buyCondition" type="number" placeholder="매수 기준가"/><input class="field" id="sellCondition" type="number" placeholder="매도 기준가"/><button class="btn btn-ghost" onclick="saveCondition()">저장</button></div></details>`;chartPayload={bars:daily.items,indicators:ind.items};drawChart();renderWatch()}catch(e){stockDetail.innerHTML=`<div class="empty">상세 데이터를 불러오지 못했습니다<br><span class="subtle">${safe(e.message)}</span></div>`}}
       function drawChart(){if(!chartPayload)return;const canvas=document.getElementById('priceChart');if(!canvas)return;const rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=rect.width,h=rect.height;canvas.width=w*dpr;canvas.height=h*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);const bars=chartPayload.bars,inds=chartPayload.indicators,pad={l:7,r:55,t:12,b:20},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b,values=bars.flatMap(x=>[x.high_price,x.low_price]).concat(inds.flatMap(x=>[x.sma_5,x.sma_20]).filter(x=>x!==null));let min=Math.min(...values),max=Math.max(...values),range=max-min||1;min-=range*.04;max+=range*.04;const y=v=>pad.t+(max-v)/(max-min)*ph,x=i=>pad.l+(i+.5)*pw/bars.length;c.strokeStyle='#182538';c.lineWidth=1;c.fillStyle='#60718a';c.font='9px sans-serif';for(let i=0;i<5;i++){const yy=pad.t+ph*i/4,val=max-(max-min)*i/4;c.beginPath();c.moveTo(pad.l,yy);c.lineTo(pad.l+pw,yy);c.stroke();c.fillText(Math.round(val).toLocaleString(),pad.l+pw+5,yy+3)}const cw=Math.max(2,pw/bars.length*.62);bars.forEach((b,i)=>{const up=b.close_price>=b.open_price,color=up?'#ff4d61':'#4c8dff',xx=x(i);c.strokeStyle=color;c.fillStyle=color;c.beginPath();c.moveTo(xx,y(b.high_price));c.lineTo(xx,y(b.low_price));c.stroke();const top=y(Math.max(b.open_price,b.close_price)),bottom=y(Math.min(b.open_price,b.close_price));c.fillRect(xx-cw/2,top,cw,Math.max(1,bottom-top))});const line=(key,color)=>{c.strokeStyle=color;c.lineWidth=1.4;c.beginPath();let started=false;inds.forEach((v,i)=>{if(v[key]===null)return;const xx=x(i),yy=y(v[key]);started?c.lineTo(xx,yy):c.moveTo(xx,yy);started=true});c.stroke()};line('sma_5','#f6b94b');line('sma_20','#51a8ff');c.fillStyle='#60718a';c.font='8px sans-serif';[0,Math.floor(bars.length/2),bars.length-1].forEach(i=>{const d=bars[i].trade_date;c.fillText(`${d.slice(4,6)}.${d.slice(6)}`,Math.min(x(i)-12,w-78),h-5)})}
       async function saveCondition(){if(!selectedCode)return;const buy=buyCondition.value,sell=sellCondition.value;await api('/api/conditions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stock_code:selectedCode,buy_below:buy?Number(buy):null,sell_above:sell?Number(sell):null})});orderStatus.textContent='가격 조건을 저장했습니다';await load()}
       function setOrderSide(side){orderSide=side;buyTab.className=`ticket-tab ${side==='buy'?'active buy':''}`;sellTab.className=`ticket-tab ${side==='sell'?'active sell':''}`;orderSubmit.className=`btn ${side==='buy'?'btn-buy':'btn-sell'} btn-block`;orderSubmit.textContent=`모의 ${side==='buy'?'매수':'매도'} 주문`}
@@ -507,6 +668,6 @@ def dashboard_ui():
       async function submitMockOrder(){if(!selectedCode){orderStatus.textContent='관심종목을 먼저 선택하세요';return}const quantity=Number(orderQuantity.value),price=Number(orderPrice.value);if(!Number.isInteger(quantity)||quantity<1||!price){orderStatus.textContent='가격과 수량을 확인하세요';return}orderStatus.textContent='모의주문 처리 중...';try{await api('/api/mock-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stock_code:selectedCode,side:orderSide,quantity,price})});orderStatus.textContent=`모의 ${orderSide==='buy'?'매수':'매도'} 주문이 기록되었습니다`;await load()}catch(e){orderStatus.textContent=e.message}}
       function renderTables(){const hs=dashboard.account.holdings||[];holdingCount.textContent=hs.length;holdings.innerHTML=hs.length?hs.map(x=>{const rate=Number(x.profit_loss_rate||0),tone=rate>0?'profit':rate<0?'loss':'neutral';return `<tr><td><strong>${safe(x.stock_name)}</strong><div class="stock-code">${safe(x.stock_code)}</div></td><td class="number">${number(x.quantity)}</td><td class="number">${money(x.average_price)}</td><td class="number">${money(x.evaluation_amount)}</td><td class="number ${tone}">${money(x.profit_loss_amount||0)}</td><td class="number ${tone}">${rate>0?'+':''}${decimal(rate)}%</td></tr>`}).join(''):emptyRow(6,'현재 보유종목이 없습니다');orders.innerHTML=dashboard.orders.length?dashboard.orders.map(x=>`<tr><td>${safe(x.id)}</td><td><strong>${safe(x.stock_name)}</strong><div class="stock-code">${safe(x.stock_code)}</div></td><td><span class="badge side-${safe(x.side)}">모의 ${x.side==='buy'?'매수':'매도'}</span></td><td class="number">${number(x.quantity)}</td><td class="number">${money(x.price)}</td><td><span class="neutral">${safe(x.status)}</span></td></tr>`).join(''):emptyRow(6,'모의주문 내역이 없습니다')}
       async function load(){lastUpdated.textContent='갱신 중...';try{dashboard=await api('/api/dashboard');const connected=dashboard.account_available!==false,unit=v=>v===null||v===undefined?'-':`${number(v)}<span class="kpi-unit">원</span>`;evalAmount.innerHTML=unit(dashboard.account.total_evaluation_amount);deposit.innerHTML=unit(dashboard.account.deposit_amount);purchase.innerHTML=unit(dashboard.account.total_purchase_amount);availableAmount.textContent=money(dashboard.account.deposit_amount);marketState.textContent=connected?'KIS Virtual Connected':'KIS 계좌 연결 실패';marketState.style.color=connected?'var(--green)':'var(--amber)';if(!selectedCode||!dashboard.watchlist.some(x=>x.stock_code===selectedCode))selectedCode=dashboard.watchlist[0]?.stock_code||null;renderWatch();renderTables();lastUpdated.textContent=connected?`${new Date().toLocaleTimeString('ko-KR')} 기준`:'계좌 조회 실패 · 로컬 기능 사용 가능';if(selectedCode)await selectStock(selectedCode);enrichWatchPrices()}catch(e){lastUpdated.textContent='대시보드 갱신 실패';watch.innerHTML=`<div class="empty">${safe(e.message)}</div>`;orders.innerHTML=emptyRow(6,'내역을 불러오지 못했습니다')}}
-      query.addEventListener('keydown',e=>{if(e.key==='Enter')searchStocks()});window.addEventListener('resize',()=>drawChart());setOrderSide('buy');updateEstimate();load();
+      query.addEventListener('keydown',e=>{if(e.key==='Enter')searchStocks()});window.addEventListener('resize',()=>drawChart());setOrderSide('buy');updateEstimate();connectQuotes();load();
     </script></body></html>
     """
