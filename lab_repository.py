@@ -133,14 +133,14 @@ class SQLiteLabRepository:
                        (
                            SELECT fetched_at
                            FROM daily_prices AS latest
-                           WHERE latest.stock_code = daily_prices.stock_code
+                           WHERE latest.stock_code = ?
                            ORDER BY trade_date DESC
                            LIMIT 1
                        ) AS last_fetched_at
                 FROM daily_prices
                 WHERE stock_code = ?
                 """,
-                (stock_code,),
+                (stock_code, stock_code),
             ).fetchone()
         return dict(row)
 

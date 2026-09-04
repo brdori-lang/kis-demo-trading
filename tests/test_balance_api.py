@@ -34,6 +34,19 @@ def test_dashboard_uses_declared_price_contract():
     assert "p.output" not in page.text
 
 
+def test_dashboard_submits_only_to_kis_vts_order_api():
+    page = client.get("/ui/dashboard")
+
+    assert page.status_code == 200
+    assert "한국투자증권 모의투자 주문" in page.text
+    assert "KIS VTS · 실제 모의투자 서버 전송" in page.text
+    assert "submitKISVirtualOrder()" in page.text
+    assert "api('/api/kis/orders'" in page.text
+    assert "submitMockOrder()" not in page.text
+    assert "api('/api/mock-orders'" not in page.text
+    assert "confirm(`한국투자증권 VTS 모의투자 계좌로" in page.text
+
+
 def test_account_balance_ui_is_utf8_korean():
     response = client.get("/ui/account-balance")
 
