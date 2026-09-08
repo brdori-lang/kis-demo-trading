@@ -59,6 +59,32 @@ def test_service_reconnects_and_resubscribes_with_fake_websocket():
     asyncio.run(_assert_service_reconnects())
 
 
+def test_connected_loop_cancellation_drains_child_tasks():
+    async def run():
+        receiving = asyncio.Event()
+        stopped = asyncio.Event()
+
+        class Socket:
+            async def recv(self):
+                receiving.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+
+        service = quotes.RealtimeQuoteService()
+        task = asyncio.create_task(service._connected_loop(Socket(), 'approval', None))
+        await receiving.wait()
+        children = asyncio.all_tasks() - {asyncio.current_task(), task}
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert stopped.is_set()
+        assert children and all(child.done() for child in children)
+
+    asyncio.run(run())
+
+
 async def _assert_service_reconnects():
     connected = []
     quote_received = asyncio.Event()

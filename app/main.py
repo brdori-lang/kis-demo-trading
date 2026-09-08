@@ -50,7 +50,7 @@ class OperationSettingsRequest(SecureRequest):
     max_order_amount: int | None = Field(default=None, ge=10_000)
     stop_loss_rate: float | None = Field(default=None, gt=0, le=100)
     take_profit_rate: float | None = Field(default=None, gt=0, le=1000)
-    analysis_schedule: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    analysis_schedule: str | None = Field(default=None, min_length=5, max_length=100, pattern=r"^(?:([01]\d|2[0-3]):[0-5]\d|[0-9*/,-]+(?: [0-9*/,-]+){4})$")
 
 
 class UniverseSettingsRequest(SecureRequest):

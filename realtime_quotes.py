@@ -165,11 +165,17 @@ class RealtimeQuoteService:
         while not self._stop.is_set():
             receive_task = asyncio.create_task(websocket.recv())
             command_task = asyncio.create_task(self.commands.get())
-            done, pending = await asyncio.wait(
-                {receive_task, command_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
+            tasks = {receive_task, command_task}
+            try:
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                # Drain child tasks even when the browser disconnects during wait.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             if receive_task in done:
                 raw = receive_task.result()
                 event = parse_kis_message(raw)
