@@ -57,6 +57,43 @@ def buying_power(stock_code: str = Query(pattern=r"^[0-9]{6}$"),
     return get_buying_power(stock_code, order_price)
 
 
+def order_service():
+    from app.main import kis_order_service
+    return kis_order_service()
+
+
+def public_order(order: dict) -> dict:
+    fields = ("id", "created_at", "stock_code", "side", "quantity", "filled_quantity",
+              "remaining_quantity", "requested_price", "status")
+    return {name: order.get(name) for name in fields}
+
+
+def public_reconciliation(run: dict | None) -> dict | None:
+    if not run:
+        return None
+    fields = ("created_at", "matched", "corrected", "mismatch", "manual_review_required")
+    return {name: run.get(name) for name in fields}
+
+
+@router.get("/orders", dependencies=[Depends(require_aura_read_key)])
+def orders(refresh: bool = Query(False), service=Depends(order_service)):
+    if refresh:
+        service.refresh()
+    return {"orders": [public_order(item) for item in service.store.list()[:50]]}
+
+
+@router.get("/reconciliation", dependencies=[Depends(require_aura_read_key)])
+def reconciliation(service=Depends(order_service)):
+    runs = service.store.reconciliation_runs(1)
+    return {"reconciliation": public_reconciliation(runs[0] if runs else None)}
+
+
+@router.post("/reconciliation/refresh", dependencies=[Depends(require_aura_read_key)])
+def refresh_reconciliation(service=Depends(order_service)):
+    service.reconcile()
+    return {"reconciliation": public_reconciliation(service.store.reconciliation_runs(1)[0])}
+
+
 @router.post("/previews")
 def preview(payload: AuraExecutionPlan, service=Depends(integration_service)):
     return service.preview(payload)
