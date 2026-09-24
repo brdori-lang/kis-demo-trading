@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(export PYTHONDONTWRITEBYTECODE=1)",
+      "Bash(myapi/Scripts/python.exe -c \"import sqlite3,sys;print\\(sqlite3.sqlite_version, sys.version\\)\")",
+      "Bash(myapi/Scripts/python.exe -B -m pytest -q -p no:cacheprovider tests/test_aura_integration.py)",
+      "Bash(cd /c/Users/brdor && ls -d */ 2>/dev/null | head -50; ls -d aura* 2>/dev/null)",
+      "Read(//c/Users/brdor/**)",
+      "Read(//c/Users/brdor/aura-trading-platform/**)",
+      "Read(//c/Users/brdor/aura-trading-platform/src/aura_trading_platform/domain/**)",
+      "Read(//c/Users/brdor/aura-trading-platform/src/aura_trading_platform/application/**)"
+    ]
+  }
+}
