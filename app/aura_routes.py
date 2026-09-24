@@ -107,8 +107,8 @@ def cancel_order(order_id: Identifier, service=Depends(order_service)):
 
 
 def realtime_service():
-    from realtime_quotes import RealtimeQuoteService
-    return RealtimeQuoteService()
+    from realtime_quotes import REALTIME_ORDERBOOK_TR_ID, REALTIME_PRICE_TR_ID, RealtimeQuoteService
+    return RealtimeQuoteService(tr_ids=(REALTIME_PRICE_TR_ID, REALTIME_ORDERBOOK_TR_ID))
 
 
 @router.get("/realtime/stream", dependencies=[Depends(require_aura_read_key)])

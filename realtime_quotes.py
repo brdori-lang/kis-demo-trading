@@ -29,6 +29,18 @@ REALTIME_PRICE_COLUMNS = (
     "previous_same_time_volume_rate", "hour_class_code", "market_close_code",
     "vi_standard_price",
 )
+REALTIME_ORDERBOOK_TR_ID = "H0STASP0"
+REALTIME_ORDERBOOK_COLUMNS = (
+    "stock_code", "business_hour", "hour_class_code",
+    *(f"ask_price_{i}" for i in range(1, 11)), *(f"bid_price_{i}" for i in range(1, 11)),
+    *(f"ask_quantity_{i}" for i in range(1, 11)), *(f"bid_quantity_{i}" for i in range(1, 11)),
+    "total_ask_quantity", "total_bid_quantity",
+)
+# tr_id -> (event type, official column order). Only market data TRs keyed by stock code.
+REALTIME_MARKET_TRS = {
+    REALTIME_PRICE_TR_ID: ("quote", REALTIME_PRICE_COLUMNS),
+    REALTIME_ORDERBOOK_TR_ID: ("orderbook", REALTIME_ORDERBOOK_COLUMNS),
+}
 
 logger = logging.getLogger(__name__)
 EventHandler = Callable[[dict], Awaitable[None]]
@@ -53,9 +65,12 @@ async def issue_vts_approval_key() -> str:
     return approval_key
 
 
-def subscription_message(approval_key: str, stock_code: str, subscribe: bool) -> str:
+def subscription_message(approval_key: str, stock_code: str, subscribe: bool,
+                         tr_id: str = REALTIME_PRICE_TR_ID) -> str:
     if len(stock_code) != 6 or not stock_code.isdigit():
         raise ValueError("종목코드는 6자리 숫자여야 합니다.")
+    if tr_id not in REALTIME_MARKET_TRS:
+        raise ValueError("지원하지 않는 실시간 TR입니다.")
     return json.dumps(
         {
             "header": {
@@ -64,7 +79,7 @@ def subscription_message(approval_key: str, stock_code: str, subscribe: bool) ->
                 "tr_type": "1" if subscribe else "2",
                 "content-type": "utf-8",
             },
-            "body": {"input": {"tr_id": REALTIME_PRICE_TR_ID, "tr_key": stock_code}},
+            "body": {"input": {"tr_id": tr_id, "tr_key": stock_code}},
         },
         ensure_ascii=False,
     )
@@ -75,12 +90,13 @@ def parse_kis_message(message: str) -> dict | None:
         return None
     if message[0] in {"0", "1"}:
         parts = message.split("|", 3)
-        if len(parts) != 4 or parts[1] != REALTIME_PRICE_TR_ID:
+        if len(parts) != 4 or parts[1] not in REALTIME_MARKET_TRS:
             return None
+        event_type, columns = REALTIME_MARKET_TRS[parts[1]]
         values = parts[3].split("^")
-        if len(values) < len(REALTIME_PRICE_COLUMNS):
-            raise ValueError("KIS 실시간 체결가 필드 수가 올바르지 않습니다.")
-        return {"type": "quote", **dict(zip(REALTIME_PRICE_COLUMNS, values))}
+        if len(values) < len(columns):
+            raise ValueError("KIS 실시간 시세 필드 수가 올바르지 않습니다.")
+        return {"type": event_type, **dict(zip(columns, values))}
 
     payload = json.loads(message)
     if payload.get("header", {}).get("tr_id") == "PINGPONG":
@@ -95,9 +111,13 @@ def parse_kis_message(message: str) -> dict | None:
 
 
 class RealtimeQuoteService:
-    def __init__(self, approval_provider=issue_vts_approval_key, connect_factory=websockets.connect):
+    def __init__(self, approval_provider=issue_vts_approval_key, connect_factory=websockets.connect,
+                 tr_ids: tuple[str, ...] = (REALTIME_PRICE_TR_ID,)):
+        if not tr_ids or any(tr_id not in REALTIME_MARKET_TRS for tr_id in tr_ids):
+            raise ValueError("지원하지 않는 실시간 TR입니다.")
         self.approval_provider = approval_provider
         self.connect_factory = connect_factory
+        self.tr_ids = tuple(tr_ids)
         self.subscriptions: set[str] = set()
         self.commands: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.state = "disconnected"
@@ -146,7 +166,8 @@ class RealtimeQuoteService:
                     retry = 0
                     await handler({"type": "connection", "state": self.state})
                     for stock_code in sorted(self.subscriptions):
-                        await websocket.send(subscription_message(approval_key, stock_code, True))
+                        for tr_id in self.tr_ids:
+                            await websocket.send(subscription_message(approval_key, stock_code, True, tr_id))
                     await self._connected_loop(websocket, approval_key, handler)
             except asyncio.CancelledError:
                 raise
@@ -185,6 +206,7 @@ class RealtimeQuoteService:
                     await handler(event)
             if command_task in done:
                 action, stock_code = command_task.result()
-                await websocket.send(
-                    subscription_message(approval_key, stock_code, action == "subscribe")
-                )
+                for tr_id in self.tr_ids:
+                    await websocket.send(
+                        subscription_message(approval_key, stock_code, action == "subscribe", tr_id)
+                    )

@@ -43,6 +43,34 @@ def public_quote(event: dict) -> dict | None:
     }
 
 
+ORDERBOOK_DEPTH = 3  # M:ONE shows a compact 3-level book; the full 10 levels stay in the LAB
+
+
+def _levels(event: dict, side: str) -> list[dict]:
+    levels = []
+    for i in range(1, ORDERBOOK_DEPTH + 1):
+        price = _int(event.get(f"{side}_price_{i}"))
+        if not price or price <= 0:
+            break  # never interpolate a missing level
+        levels.append({"price": price, "quantity": _int(event.get(f"{side}_quantity_{i}"))})
+    return levels
+
+
+def public_orderbook(event: dict) -> dict | None:
+    asks, bids = _levels(event, "ask"), _levels(event, "bid")
+    if not asks and not bids:
+        return None
+    return {
+        "type": "orderbook",
+        "stock_code": event.get("stock_code"),
+        "asks": asks,
+        "bids": bids,
+        "total_ask_quantity": _int(event.get("total_ask_quantity")),
+        "total_bid_quantity": _int(event.get("total_bid_quantity")),
+        "business_hour": event.get("business_hour") or None,
+    }
+
+
 def public_event(event: dict, stock_code: str) -> dict | None:
     kind = event.get("type")
     if kind == "connection":
@@ -51,6 +79,8 @@ def public_event(event: dict, stock_code: str) -> dict | None:
         return {"type": "subscription", "success": bool(event.get("success"))}
     if kind == "quote" and event.get("stock_code") == stock_code:
         return public_quote(event)
+    if kind == "orderbook" and event.get("stock_code") == stock_code:
+        return public_orderbook(event)
     return None
 
 

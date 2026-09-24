@@ -81,3 +81,69 @@ def test_idle_stream_sends_heartbeat_and_stops_kis_session_when_mone_disconnects
         return service
 
     assert asyncio.run(scenario()).stopped
+
+
+def orderbook_frame(stock_code="005930", asks=("70200", "70300", "70400"), bids=("70100", "70000", "69900")):
+    import realtime_quotes as quotes
+    values = {name: "" for name in quotes.REALTIME_ORDERBOOK_COLUMNS}
+    values.update(stock_code=stock_code, business_hour="101531", hour_class_code="0",
+                  total_ask_quantity="5000", total_bid_quantity="6000")
+    for i, (a, b) in enumerate(zip(asks, bids), start=1):
+        values.update({f"ask_price_{i}": a, f"bid_price_{i}": b,
+                       f"ask_quantity_{i}": str(100 * i), f"bid_quantity_{i}": str(200 * i)})
+    return f"0|{quotes.REALTIME_ORDERBOOK_TR_ID}|1|" + "^".join(values[c] for c in quotes.REALTIME_ORDERBOOK_COLUMNS)
+
+
+def test_h0stasp0_orderbook_is_parsed_with_official_column_order_and_subscribed_with_price():
+    import asyncio
+    import realtime_quotes as quotes
+    from aura_realtime import public_event
+
+    assert json.loads(quotes.subscription_message("approval", "005930", True, "H0STASP0"))["body"]["input"] == {
+        "tr_id": "H0STASP0", "tr_key": "005930"}
+    try:
+        quotes.subscription_message("approval", "005930", True, "H0STCNI0")  # never a real-account TR
+        raise AssertionError("unsupported TR accepted")
+    except ValueError:
+        pass
+    event = quotes.parse_kis_message(orderbook_frame())
+    assert event["type"] == "orderbook" and event["ask_price_1"] == "70200" and event["bid_quantity_3"] == "600"
+    assert public_event(event, "005930") == {
+        "type": "orderbook", "stock_code": "005930",
+        "asks": [{"price": 70200, "quantity": 100}, {"price": 70300, "quantity": 200}, {"price": 70400, "quantity": 300}],
+        "bids": [{"price": 70100, "quantity": 200}, {"price": 70000, "quantity": 400}, {"price": 69900, "quantity": 600}],
+        "total_ask_quantity": 5000, "total_bid_quantity": 6000, "business_hour": "101531"}
+    thin = public_event(quotes.parse_kis_message(orderbook_frame(asks=("70200", "", "70400"))), "005930")
+    assert thin["asks"] == [{"price": 70200, "quantity": 100}]  # a gap ends the book; no interpolation
+    assert public_event(quotes.parse_kis_message(orderbook_frame(asks=("",) * 3, bids=("",) * 3)), "005930") is None
+    assert public_event(event, "000660") is None
+
+    sent = []
+
+    class Socket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def send(self, message):
+            sent.append(json.loads(message)["body"]["input"])
+
+        async def recv(self):
+            await asyncio.Event().wait()
+
+    async def scenario():
+        service = routes.realtime_service()
+        service.approval_provider = lambda: asyncio.sleep(0, result="approval")
+        service.connect_factory = lambda *a, **k: Socket()
+        await service.subscribe("005930")
+        await service.start(lambda e: asyncio.sleep(0))
+        for _ in range(50):
+            if len(sent) == 2:
+                break
+            await asyncio.sleep(0.01)
+        await service.stop()
+
+    asyncio.run(scenario())
+    assert sent == [{"tr_id": "H0STCNT0", "tr_key": "005930"}, {"tr_id": "H0STASP0", "tr_key": "005930"}]
