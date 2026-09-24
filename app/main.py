@@ -13,11 +13,13 @@ from kis_virtual_orders import DuplicateOrderError, KISVirtualOrderService, Orde
 from operations import JOB_DEFINITIONS, OperationsService
 from realtime_quotes import RealtimeQuoteService
 from app.operations_ui import render_operations_ui
+from app.aura_routes import router as aura_router
 from strategy_engine import evaluate_lab_strategy_v1
 from trading_lab import calculate_signal, search_stocks, stock_name, store
 
 
 app = FastAPI(title="KIS Open API LAB")
+app.include_router(aura_router)
 
 StockCode = Annotated[str, Field(pattern=r"^\d{6}$")]
 
@@ -651,6 +653,43 @@ def dashboard_ui():
       const safe=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
       const badge=s=>`<span class="badge ${safe(s||'UNAVAILABLE')}">${safe(s||'UNAVAILABLE')}</span>`;
       const emptyRow=(cols,text)=>`<tr><td colspan="${cols}" class="neutral">${text}</td></tr>`;
+      const auraExecutionId=new URLSearchParams(location.search).get('aura_execution_id');
+      let auraPreview=null,auraSubmitting=false,auraRequestVersion=0;
+      function setupAuraPanel(){
+        if(auraExecutionId===null)return;
+        const normalPanel=document.querySelector('.order-panel');normalPanel.style.display='none';
+        normalPanel.insertAdjacentHTML('afterend',`<article class="panel" id="auraOrderPanel">
+          <div class="panel-title"><h2>AURA 주문 Preview</h2></div>
+          <div class="paper-label">KIS_VIRTUAL · 사용자 확인 후 VTS 전송</div>
+          <div id="auraOrderDetails" class="order-reference">저장된 Preview를 불러오는 중입니다.</div>
+          <p class="order-warning">스냅샷 기준가를 LIMIT 지정가로 사용합니다. 주문 내용은 읽기 전용이며 손절·익절 자동주문은 실행하지 않습니다.</p>
+          <button id="auraSubmit" class="btn btn-buy btn-block" disabled onclick="submitAuraOrder()">확인 후 VTS 주문 전송</button>
+          <button id="auraRefresh" class="btn btn-block" onclick="loadAuraPreview(true)">주문 상태 새로고침</button>
+          <div id="auraOrderStatus" class="status-line" role="status"></div></article>`);
+        loadAuraPreview(false);
+      }
+      function renderAuraPreview(d){
+        auraPreview=d;const p=d.preview;
+        const rows=[['AURA Plan ID',d.plan_id],['모드',d.execution_mode],['종목',p.stock_code],['방향',p.side],['수량',`${p.quantity}주`],['LIMIT 가격',money(p.price)],['예상 주문금액',money(p.quantity*p.price)],['계좌',p.account],['Preview 만료',new Date(d.expires_at).toLocaleString('ko-KR')]];
+        document.getElementById('auraOrderDetails').innerHTML=rows.map(([k,v])=>`<div><span>${safe(k)}</span><strong>${safe(v)}</strong></div>`).join('');
+        document.getElementById('auraSubmit').disabled=auraSubmitting||d.status!=='PREVIEWED'||!p.submit_enabled||Date.now()>=Date.parse(d.expires_at);
+        document.getElementById('auraOrderStatus').textContent=`${d.status} · 주문번호 ${d.broker_order_id||'-'} · 체결 ${d.filled_quantity} / 잔량 ${d.remaining_quantity}${d.requires_review?' · 접수 여부 확인 필요 · 재주문 금지':''}${d.stale?' · 최신 상태 미확인':''}${d.error?' · '+d.error:''}`;
+      }
+      async function loadAuraPreview(refresh=false){
+        if(auraSubmitting)return;const version=++auraRequestVersion;
+        try{const d=await api(`/api/integrations/aura/executions/${encodeURIComponent(auraExecutionId)}?refresh=${refresh}`);if(version===auraRequestVersion)renderAuraPreview(d)}
+        catch(e){if(version!==auraRequestVersion)return;document.getElementById('auraSubmit').disabled=true;document.getElementById('auraOrderStatus').textContent=`Preview 조회 실패: ${e.message}`}
+      }
+      async function submitAuraOrder(){
+        if(auraSubmitting||!auraPreview||auraPreview.status!=='PREVIEWED'||!auraPreview.preview.submit_enabled)return;
+        if(Date.now()>=Date.parse(auraPreview.expires_at)){document.getElementById('auraSubmit').disabled=true;document.getElementById('auraOrderStatus').textContent='Preview가 만료되었습니다';return}
+        const p=auraPreview.preview;
+        if(!confirm(`한국투자증권 VTS 모의투자 계좌로 AURA ${auraPreview.plan_id}: ${p.stock_code} ${p.side} ${p.quantity}주를 LIMIT ${money(p.price)}에 전송합니다. 계속할까요?`))return;
+        auraSubmitting=true;++auraRequestVersion;document.getElementById('auraSubmit').disabled=true;document.getElementById('auraOrderStatus').textContent='VTS 주문 전송 중...';
+        try{const d=await api(`/api/integrations/aura/executions/${encodeURIComponent(auraExecutionId)}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true,preview_hash:auraPreview.preview_hash})});auraSubmitting=false;renderAuraPreview(d)}
+        catch(e){document.getElementById('auraOrderStatus').textContent=`전송 결과 확인 필요: ${e.message} · 상태를 조회하세요. 자동 재전송하지 않습니다.`}
+        finally{auraSubmitting=false}
+      }
       function connectQuotes(){clearTimeout(reconnectTimer);const protocol=location.protocol==='https:'?'wss:':'ws:';quoteSocket=new WebSocket(`${protocol}//${location.host}/ws/quotes`);quoteSocket.onopen=()=>{marketState.textContent='KIS 실시간 연결 중';if(selectedCode)subscribeRealtime(selectedCode)};quoteSocket.onmessage=e=>{const event=JSON.parse(e.data);if(event.type==='connection'){marketState.textContent=event.state==='connected'?'KIS VTS Realtime Connected':event.state==='reconnecting'?'KIS 실시간 재연결 중':'KIS 실시간 연결 중';marketState.style.color=event.state==='connected'?'var(--green)':'var(--amber)';if(event.state==='connected'&&selectedCode)subscribeRealtime(selectedCode)}else if(event.type==='quote'){applyRealtimeQuote(event)}};quoteSocket.onclose=()=>{marketState.textContent='KIS 실시간 재연결 대기';marketState.style.color='var(--amber)';realtimeCode=null;reconnectTimer=setTimeout(connectQuotes,2000)}}
       function subscribeRealtime(code){if(!quoteSocket||quoteSocket.readyState!==WebSocket.OPEN)return;if(realtimeCode&&realtimeCode!==code)quoteSocket.send(JSON.stringify({action:'unsubscribe',stock_code:realtimeCode}));realtimeCode=code;quoteSocket.send(JSON.stringify({action:'subscribe',stock_code:code}))}
       function applyRealtimeQuote(q){const item=dashboard?.watchlist.find(x=>x.stock_code===q.stock_code);if(!item)return;const current=Number(q.current_price),change=Number(q.change),rate=Number(q.change_rate);if(Number.isFinite(current)&&current>0)item.current_price=current;if(Number.isFinite(rate))item.changeRate=rate;renderWatch();if(selectedCode!==q.stock_code)return;orderCurrent.textContent=money(current);const priceEl=document.querySelector('.hero-price strong'),changeEl=document.querySelector('.hero-price .price-change');if(priceEl)priceEl.textContent=money(current);if(changeEl){changeEl.className=`price-change ${tone(change)}`;changeEl.textContent=`${change>0?'+':''}${number(change)} (${rate>0?'+':''}${decimal(rate)}%)`}}
@@ -668,6 +707,6 @@ def dashboard_ui():
       async function submitKISVirtualOrder(){if(!selectedCode){orderStatus.textContent='관심종목을 먼저 선택하세요';return}const quantity=Number(orderQuantity.value),price=Number(orderPrice.value),side=orderSide.toUpperCase();if(!Number.isInteger(quantity)||quantity<1||!Number.isInteger(price)||price<1){orderStatus.textContent='가격과 수량을 확인하세요';return}if(!confirm(`한국투자증권 VTS 모의투자 계좌로 ${selectedCode} ${side==='BUY'?'매수':'매도'} ${quantity}주를 ${money(price)}에 전송합니다. 계속할까요?`))return;const idempotencyKey=`dashboard-${Date.now()}-${crypto.randomUUID()}`;orderSubmit.disabled=true;orderStatus.textContent='KIS VTS 주문 전송 중...';try{const result=await api('/api/kis/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({idempotency_key:idempotencyKey,stock_code:selectedCode,side,quantity,price,order_type:'LIMIT',execution_mode:'KIS_VIRTUAL'})});orderStatus.textContent=`VTS 주문 접수 · ${result.order.status} · 주문번호 ${result.order.broker_order_id||'-'}`;await load()}catch(e){orderStatus.textContent=e.message}finally{orderSubmit.disabled=false}}
       function renderTables(){const hs=dashboard.account.holdings||[];holdingCount.textContent=hs.length;holdings.innerHTML=hs.length?hs.map(x=>{const rate=Number(x.profit_loss_rate||0),tone=rate>0?'profit':rate<0?'loss':'neutral';return `<tr><td><strong>${safe(x.stock_name)}</strong><div class="stock-code">${safe(x.stock_code)}</div></td><td class="number">${number(x.quantity)}</td><td class="number">${money(x.average_price)}</td><td class="number">${money(x.evaluation_amount)}</td><td class="number ${tone}">${money(x.profit_loss_amount||0)}</td><td class="number ${tone}">${rate>0?'+':''}${decimal(rate)}%</td></tr>`}).join(''):emptyRow(6,'현재 보유종목이 없습니다');orders.innerHTML=dashboard.orders.length?dashboard.orders.map(x=>`<tr><td>${safe(x.broker_order_id||x.id)}</td><td><strong>${safe(x.stock_code)}</strong></td><td><span class="badge side-${safe(x.side.toLowerCase())}">VTS ${x.side==='BUY'?'매수':'매도'}</span></td><td class="number">${number(x.quantity)}</td><td class="number">${money(x.requested_price)}</td><td><span class="neutral">${safe(x.status)}</span></td></tr>`).join(''):emptyRow(6,'KIS VTS 주문 내역이 없습니다')}
       async function load(){lastUpdated.textContent='갱신 중...';try{const [dashboardData,kisOrders]=await Promise.all([api('/api/dashboard'),api('/api/kis/orders')]);dashboard=dashboardData;dashboard.orders=kisOrders.orders;const connected=dashboard.account_available!==false,unit=v=>v===null||v===undefined?'-':`${number(v)}<span class="kpi-unit">원</span>`;evalAmount.innerHTML=unit(dashboard.account.total_evaluation_amount);deposit.innerHTML=unit(dashboard.account.deposit_amount);purchase.innerHTML=unit(dashboard.account.total_purchase_amount);availableAmount.textContent=money(dashboard.account.deposit_amount);marketState.textContent=connected?'KIS VTS Connected':'KIS 계좌 연결 실패';marketState.style.color=connected?'var(--green)':'var(--amber)';if(!selectedCode||!dashboard.watchlist.some(x=>x.stock_code===selectedCode))selectedCode=dashboard.watchlist[0]?.stock_code||null;renderWatch();renderTables();lastUpdated.textContent=connected?`${new Date().toLocaleTimeString('ko-KR')} 기준`:'계좌 조회 실패 · 로컬 기능 사용 가능';if(selectedCode)await selectStock(selectedCode);enrichWatchPrices()}catch(e){lastUpdated.textContent='대시보드 갱신 실패';watch.innerHTML=`<div class="empty">${safe(e.message)}</div>`;orders.innerHTML=emptyRow(6,'내역을 불러오지 못했습니다')}}
-      query.addEventListener('keydown',e=>{if(e.key==='Enter')searchStocks()});window.addEventListener('resize',()=>drawChart());setOrderSide('buy');updateEstimate();connectQuotes();load();
+      query.addEventListener('keydown',e=>{if(e.key==='Enter')searchStocks()});window.addEventListener('resize',()=>drawChart());setOrderSide('buy');updateEstimate();setupAuraPanel();connectQuotes();load();
     </script></body></html>
     """
