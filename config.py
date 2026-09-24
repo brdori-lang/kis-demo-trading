@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     KIS_VIRTUAL_ORDER_SUBMIT_ENABLED: bool = False
     MAX_ORDER_AMOUNT: int = 1_000_000
     MAX_ORDER_QUANTITY: int = 100
+    AURA_INTEGRATION_READ_KEY: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

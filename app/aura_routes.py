@@ -1,10 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+import hmac
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from aura_integration import AuraExecutionPlan, AuraIntegrationService, ConfirmPreview, Identifier, IntegrationError
 from kis_virtual_orders import OrderSafetyError
+from kis_api import get_buying_power
+from config import settings
 
 
 class IntegrationRoute(APIRoute):
@@ -20,6 +23,8 @@ class IntegrationRoute(APIRoute):
                     {"loc": e["loc"], "type": e["type"], "msg": "Invalid integration input"}
                     for e in exc.errors()
                 ]})
+            except HTTPException:
+                raise
             except IntegrationError as exc:
                 raise HTTPException(exc.status_code, str(exc)) from None
             except OrderSafetyError:
@@ -38,6 +43,18 @@ def integration_service():
     # Resolve the existing factory lazily; do not create DBs during router import.
     from app.main import kis_order_service, store
     return AuraIntegrationService(store.repository, kis_order_service())
+
+
+def require_aura_read_key(x_aura_read_key: str | None = Header(default=None)):
+    expected = settings.AURA_INTEGRATION_READ_KEY
+    if not expected or not x_aura_read_key or not hmac.compare_digest(expected, x_aura_read_key):
+        raise HTTPException(403, "M:ONE 읽기 권한이 필요합니다.")
+
+
+@router.get("/buying-power", dependencies=[Depends(require_aura_read_key)])
+def buying_power(stock_code: str = Query(pattern=r"^[0-9]{6}$"),
+                 order_price: int = Query(gt=0, le=100_000_000)):
+    return get_buying_power(stock_code, order_price)
 
 
 @router.post("/previews")

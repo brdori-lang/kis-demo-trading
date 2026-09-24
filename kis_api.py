@@ -121,6 +121,39 @@ def get_account_balance():
     return response.json()
 
 
+def get_buying_power(stock_code: str, order_price: int) -> dict:
+    """VTS limit-order capacity using cash and quantity that exclude margin credit."""
+    require_virtual_environment()
+    if not isinstance(stock_code, str) or len(stock_code) != 6 or not stock_code.isdigit():
+        raise ValueError("종목코드는 숫자 6자리여야 합니다.")
+    if isinstance(order_price, bool) or not isinstance(order_price, int) or order_price <= 0:
+        raise ValueError("주문 단가는 양의 정수여야 합니다.")
+    account_no = (settings.KIS_ACCOUNT_NO or "").strip()
+    if not account_no:
+        raise ValueError("KIS 계좌 설정이 필요합니다.")
+    cano, product_code = _parse_account_info(account_no)
+    url = f"{KIS_VIRTUAL_DOMAIN}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+    headers = {"authorization": f"Bearer {get_access_token()}", "appkey": settings.KIS_APP_KEY,
+               "appsecret": settings.KIS_APP_SECRET, "tr_id": "VTTC8908R", "custtype": "P"}
+    params = {"CANO": cano, "ACNT_PRDT_CD": product_code, "PDNO": stock_code,
+              "ORD_UNPR": str(order_price), "ORD_DVSN": "00", "CMA_EVLU_AMT_ICLD_YN": "N",
+              "OVRS_ICLD_YN": "N"}
+    response = _kis_get(url, headers, params)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("rt_cd") != "0" or not isinstance(payload.get("output"), dict):
+        raise ValueError("KIS 매수 가능 금액 조회에 실패했습니다.")
+    output = payload["output"]
+    def amount(name):
+        value = output.get(name)
+        if value is None or not str(value).replace(",", "").isdigit():
+            raise ValueError("KIS 매수 가능 금액 응답이 불완전합니다.")
+        return int(str(value).replace(",", ""))
+    return {"stock_code": stock_code, "order_price": order_price,
+            "cash_available": min(amount("ord_psbl_cash"), amount("nrcvb_buy_amt")),
+            "quantity_available": amount("nrcvb_buy_qty"), "credit_excluded": True}
+
+
 def get_daily_item_chart_price(stock_code: str, start_date: str, end_date: str):
     require_virtual_environment()
     access_token = get_access_token()
