@@ -137,6 +137,7 @@ def test_balance_route_handles_real_kis_output_shape(monkeypatch):
                 "pdno": "005930",
                 "prdt_name": "삼성전자",
                 "hldg_qty": "10",
+                "ord_psbl_qty": "7",
                 "pchs_avg_pric": "70000",
                 "evlu_amt": "800000",
                 "evlu_pfls_amt": "100000",
@@ -154,6 +155,7 @@ def test_balance_route_handles_real_kis_output_shape(monkeypatch):
     assert payload["deposit_amount"] == "500000000"
     assert payload["total_evaluation_amount"] == "500000000"
     assert payload["holdings"][0]["stock_code"] == "005930"
+    assert payload["holdings"][0]["ord_psbl_qty"] == "7"
 
 
 def test_balance_route_hides_external_error(monkeypatch):

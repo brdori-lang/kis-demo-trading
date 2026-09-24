@@ -82,6 +82,7 @@ class HoldingResponse(BaseModel):
     stock_code: str | None = None
     stock_name: str | None = None
     quantity: str | None = None
+    ord_psbl_qty: str | None = None
     average_price: str | None = None
     evaluation_amount: str | None = None
     profit_loss_amount: str | None = None
@@ -233,6 +234,7 @@ def account_balance():
                         "stock_code": item.get("pdno"),
                         "stock_name": item.get("prdt_name"),
                         "quantity": item.get("hldg_qty"),
+                        "ord_psbl_qty": item.get("ord_psbl_qty"),
                         "average_price": item.get("pchs_avg_pric"),
                         "evaluation_amount": item.get("evlu_amt"),
                         "profit_loss_amount": item.get("evlu_pfls_amt"),
