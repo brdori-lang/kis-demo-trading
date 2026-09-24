@@ -22,6 +22,9 @@ class FakeStore:
         assert limit == 1
         return [self.run]
 
+    def get(self, order_id):
+        return self.list()[0] if order_id == "ORDER-1" else None
+
 
 class FakeService:
     def __init__(self):
@@ -33,6 +36,10 @@ class FakeService:
 
     def reconcile(self):
         self.reconciles += 1
+
+    def cancel(self, order_id):
+        self.cancels = getattr(self, "cancels", 0) + 1
+        return {**self.store.get(order_id), "status": "CANCELED", "remaining_quantity": 0}
 
 
 def test_order_history_and_reconciliation_are_authenticated_and_projected(monkeypatch):
@@ -54,5 +61,24 @@ def test_order_history_and_reconciliation_are_authenticated_and_projected(monkey
         assert "private" not in str(result)
         refreshed = client.post("/api/integrations/aura/reconciliation/refresh", headers=headers)
         assert refreshed.status_code == 200 and service.reconciles == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_cancel_requires_explicit_authenticated_action_and_remaining_quantity(monkeypatch):
+    monkeypatch.setattr(routes.settings, "AURA_INTEGRATION_READ_KEY", "test-read-key")
+    service = FakeService()
+    app.dependency_overrides[routes.order_service] = lambda: service
+    try:
+        client = TestClient(app)
+        path = "/api/integrations/aura/orders/ORDER-1/cancel"
+        assert client.post(path).status_code == 403
+        assert getattr(service, "cancels", 0) == 0
+        headers = {"X-Aura-Read-Key": "test-read-key"}
+        assert client.post(path, headers=headers).json()["order"]["status"] == "CANCELED"
+        assert service.cancels == 1
+        service.store.get = lambda order_id: {**service.store.list()[0], "remaining_quantity": 0}
+        assert client.post(path, headers=headers).status_code == 409
+        assert service.cancels == 1
     finally:
         app.dependency_overrides.clear()

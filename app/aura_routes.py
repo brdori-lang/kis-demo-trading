@@ -94,6 +94,17 @@ def refresh_reconciliation(service=Depends(order_service)):
     return {"reconciliation": public_reconciliation(service.store.reconciliation_runs(1)[0])}
 
 
+@router.post("/orders/{order_id}/cancel", dependencies=[Depends(require_aura_read_key)])
+def cancel_order(order_id: Identifier, service=Depends(order_service)):
+    order = service.store.get(order_id)
+    if not order:
+        raise HTTPException(404, "주문을 찾을 수 없습니다.")
+    if order["status"] not in {"ACKNOWLEDGED", "PARTIALLY_FILLED"} or order["remaining_quantity"] <= 0:
+        raise HTTPException(409, "취소 가능한 미체결 주문이 아닙니다.")
+    result = service.cancel(order_id)
+    return {"order": public_order(result)}
+
+
 @router.post("/previews")
 def preview(payload: AuraExecutionPlan, service=Depends(integration_service)):
     return service.preview(payload)
