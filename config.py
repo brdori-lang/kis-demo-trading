@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     MAX_ORDER_AMOUNT: int = 1_000_000
     MAX_ORDER_QUANTITY: int = 100
     AURA_INTEGRATION_READ_KEY: str = ""
+    KIS_HTS_ID: str = ""  # H0STCNI9 realtime order notices (tr_key); empty disables them
 
     model_config = SettingsConfigDict(
         env_file=".env",

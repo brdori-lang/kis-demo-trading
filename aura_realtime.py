@@ -6,10 +6,12 @@ stream of projected public fields; raw KIS frames and credentials never leave th
 """
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 
 
 HEARTBEAT_SECONDS = 15.0
+logger = logging.getLogger(__name__)
 
 
 def _int(value) -> int | None:
@@ -84,12 +86,24 @@ def public_event(event: dict, stock_code: str) -> dict | None:
     return None
 
 
-async def realtime_events(service, stock_code: str, heartbeat: float = HEARTBEAT_SECONDS) -> AsyncIterator[str]:
+def _apply_notice(notices, event: dict) -> dict | None:
+    if notices is None:
+        return None
+    try:
+        return notices.apply(event)
+    except Exception:  # the lifecycle falls back to polling/reconciliation; never crash the relay
+        logger.exception("KIS VTS order notice could not be applied")
+        return None
+
+
+async def realtime_events(service, stock_code: str, heartbeat: float = HEARTBEAT_SECONDS,
+                          notices=None) -> AsyncIterator[str]:
     """Yield NDJSON lines until the client disconnects; always stops the KIS session."""
     queue: asyncio.Queue = asyncio.Queue()
     await service.subscribe(stock_code)
     await service.start(queue.put)
     try:
+        yield json.dumps({"type": "notifications", "state": "ENABLED" if notices is not None else "DISABLED"}) + "\n"
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), heartbeat)
@@ -98,7 +112,10 @@ async def realtime_events(service, stock_code: str, heartbeat: float = HEARTBEAT
                 continue
             if event is None:  # service closed the relay
                 return
-            item = public_event(event, stock_code)
+            if event.get("type") == "order_notice":
+                item = _apply_notice(notices, event)  # projected by the processor; raw account fields dropped
+            else:
+                item = public_event(event, stock_code)
             if item:
                 yield json.dumps(item, ensure_ascii=False) + "\n"
     finally:

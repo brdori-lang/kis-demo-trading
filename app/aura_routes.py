@@ -108,14 +108,25 @@ def cancel_order(order_id: Identifier, service=Depends(order_service)):
 
 def realtime_service():
     from realtime_quotes import REALTIME_ORDERBOOK_TR_ID, REALTIME_PRICE_TR_ID, RealtimeQuoteService
-    return RealtimeQuoteService(tr_ids=(REALTIME_PRICE_TR_ID, REALTIME_ORDERBOOK_TR_ID))
+    return RealtimeQuoteService(tr_ids=(REALTIME_PRICE_TR_ID, REALTIME_ORDERBOOK_TR_ID),
+                                notice_tr_key=settings.KIS_HTS_ID or None)
+
+
+def order_notifications():
+    # H0STCNI9 needs the HTS ID; without it notices stay off and polling/reconciliation remain.
+    if not settings.KIS_HTS_ID:
+        return None
+    from app.main import kis_order_service
+    from order_notifications import OrderNotificationProcessor
+    return OrderNotificationProcessor(kis_order_service().store)
 
 
 @router.get("/realtime/stream", dependencies=[Depends(require_aura_read_key)])
-def realtime_stream(stock_code: str = Query(pattern=r"^[0-9]{6}$"), service=Depends(realtime_service)):
+def realtime_stream(stock_code: str = Query(pattern=r"^[0-9]{6}$"), service=Depends(realtime_service),
+                    notices=Depends(order_notifications)):
     # One LAB-owned KIS VTS WebSocket session per M:ONE relay; closed when M:ONE disconnects.
-    return StreamingResponse(realtime_events(service, stock_code), media_type="application/x-ndjson",
-                             headers={"Cache-Control": "no-cache"})
+    return StreamingResponse(realtime_events(service, stock_code, notices=notices),
+                             media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"})
 
 
 @router.post("/previews")

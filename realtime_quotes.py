@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -6,6 +7,8 @@ from contextlib import suppress
 
 import httpx
 import websockets
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from config import settings
 from kis_safety import KIS_VTS_REST_BASE_URL, KIS_VTS_WEBSOCKET_URL, require_virtual_environment, require_vts_websocket_url
@@ -41,6 +44,16 @@ REALTIME_MARKET_TRS = {
     REALTIME_PRICE_TR_ID: ("quote", REALTIME_PRICE_COLUMNS),
     REALTIME_ORDERBOOK_TR_ID: ("orderbook", REALTIME_ORDERBOOK_COLUMNS),
 }
+# 국내주식 실시간체결통보 [실시간-005]: VTS TR only. The real-account H0STCNI0 is never subscribed.
+REALTIME_ORDER_NOTICE_TR_ID = "H0STCNI9"
+REALTIME_ORDER_NOTICE_COLUMNS = (
+    "customer_id", "account_no", "order_no", "original_order_no", "side_code",
+    "receipt_class", "order_kind", "order_condition", "stock_code", "fill_quantity",
+    "fill_price", "fill_time", "rejected", "fill_flag", "acceptance", "branch_no",
+    "order_quantity", "account_name", "condition_price", "exchange", "popup", "filler",
+    "credit_class", "credit_loan_date", "stock_name", "order_price",
+)
+ORDER_NOTICE_MIN_FIELDS = 17  # through ORDER_QTY; later fields are not needed for the lifecycle
 
 logger = logging.getLogger(__name__)
 EventHandler = Callable[[dict], Awaitable[None]]
@@ -85,11 +98,71 @@ def subscription_message(approval_key: str, stock_code: str, subscribe: bool,
     )
 
 
-def parse_kis_message(message: str) -> dict | None:
+def notice_subscription_message(approval_key: str, hts_id: str, subscribe: bool) -> str:
+    if not hts_id or len(hts_id) > 16 or not hts_id.isascii() or not hts_id.isalnum():
+        raise ValueError("HTS ID 형식이 올바르지 않습니다.")
+    return json.dumps(
+        {
+            "header": {
+                "approval_key": approval_key,
+                "custtype": "P",
+                "tr_type": "1" if subscribe else "2",
+                "content-type": "utf-8",
+            },
+            "body": {"input": {"tr_id": REALTIME_ORDER_NOTICE_TR_ID, "tr_key": hts_id}},
+        },
+        ensure_ascii=False,
+    )
+
+
+def subscription_cipher(message: str) -> tuple[str, bytes, bytes] | None:
+    """AES256 key/IV from a SUBSCRIBE SUCCESS response (body.output.key / body.output.iv)."""
+    try:
+        payload = json.loads(message)
+        output = payload["body"]["output"]
+        key, iv = output["key"].encode("utf-8"), output["iv"].encode("utf-8")
+        tr_id = payload["header"]["tr_id"]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if len(key) != 32 or len(iv) != 16:
+        return None
+    return tr_id, key, iv
+
+
+def decrypt_notice(cipher_text: str, key: bytes, iv: bytes) -> str:
+    decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(base64.b64decode(cipher_text, validate=True)) + decryptor.finalize()
+    unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+    return (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
+
+
+def _parse_order_notice(encrypted: bool, body: str, ciphers: dict | None) -> dict | None:
+    # A notice that cannot be decrypted or parsed is dropped, never guessed; VTTC0081R
+    # reconciliation stays authoritative. Raw values (account, name) never leave the LAB.
+    if encrypted:
+        cipher = (ciphers or {}).get(REALTIME_ORDER_NOTICE_TR_ID)
+        if not cipher:
+            logger.warning("KIS VTS order notice received before its AES key; ignored")
+            return None
+        try:
+            body = decrypt_notice(body, *cipher)
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("KIS VTS order notice could not be decrypted; ignored")
+            return None
+    values = body.split("^")
+    if len(values) < ORDER_NOTICE_MIN_FIELDS:
+        logger.warning("KIS VTS order notice has too few fields; ignored")
+        return None
+    return {"type": "order_notice", **dict(zip(REALTIME_ORDER_NOTICE_COLUMNS, values))}
+
+
+def parse_kis_message(message: str, ciphers: dict | None = None) -> dict | None:
     if not message:
         return None
     if message[0] in {"0", "1"}:
         parts = message.split("|", 3)
+        if len(parts) == 4 and parts[1] == REALTIME_ORDER_NOTICE_TR_ID:
+            return _parse_order_notice(message[0] == "1", parts[3], ciphers)
         if len(parts) != 4 or parts[1] not in REALTIME_MARKET_TRS:
             return None
         event_type, columns = REALTIME_MARKET_TRS[parts[1]]
@@ -102,9 +175,11 @@ def parse_kis_message(message: str) -> dict | None:
     if payload.get("header", {}).get("tr_id") == "PINGPONG":
         return {"type": "ping", "raw": message}
     body = payload.get("body", {})
+    header = payload.get("header", {})
     return {
         "type": "status",
-        "stock_code": payload.get("header", {}).get("tr_key"),
+        # The order-notice tr_key is the HTS ID, not a stock code; it is never echoed.
+        "stock_code": None if header.get("tr_id") == REALTIME_ORDER_NOTICE_TR_ID else header.get("tr_key"),
         "success": body.get("rt_cd") == "0",
         "message": body.get("msg1", ""),
     }
@@ -112,12 +187,14 @@ def parse_kis_message(message: str) -> dict | None:
 
 class RealtimeQuoteService:
     def __init__(self, approval_provider=issue_vts_approval_key, connect_factory=websockets.connect,
-                 tr_ids: tuple[str, ...] = (REALTIME_PRICE_TR_ID,)):
+                 tr_ids: tuple[str, ...] = (REALTIME_PRICE_TR_ID,), notice_tr_key: str | None = None):
         if not tr_ids or any(tr_id not in REALTIME_MARKET_TRS for tr_id in tr_ids):
             raise ValueError("지원하지 않는 실시간 TR입니다.")
         self.approval_provider = approval_provider
         self.connect_factory = connect_factory
         self.tr_ids = tuple(tr_ids)
+        self.notice_tr_key = notice_tr_key  # HTS ID for H0STCNI9; None keeps notices off
+        self._ciphers: dict[str, tuple[bytes, bytes]] = {}
         self.subscriptions: set[str] = set()
         self.commands: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.state = "disconnected"
@@ -164,10 +241,13 @@ class RealtimeQuoteService:
                 ) as websocket:
                     self.state = "connected"
                     retry = 0
+                    self._ciphers.clear()  # every subscription answers with its own AES key/IV
                     await handler({"type": "connection", "state": self.state})
                     for stock_code in sorted(self.subscriptions):
                         for tr_id in self.tr_ids:
                             await websocket.send(subscription_message(approval_key, stock_code, True, tr_id))
+                    if self.notice_tr_key:
+                        await websocket.send(notice_subscription_message(approval_key, self.notice_tr_key, True))
                     await self._connected_loop(websocket, approval_key, handler)
             except asyncio.CancelledError:
                 raise
@@ -199,7 +279,9 @@ class RealtimeQuoteService:
                 await asyncio.gather(*tasks, return_exceptions=True)
             if receive_task in done:
                 raw = receive_task.result()
-                event = parse_kis_message(raw)
+                if raw and raw[0] == "{" and (cipher := subscription_cipher(raw)):
+                    self._ciphers[cipher[0]] = cipher[1:]
+                event = parse_kis_message(raw, self._ciphers)
                 if event and event["type"] == "ping":
                     await websocket.send(event["raw"])
                 elif event:

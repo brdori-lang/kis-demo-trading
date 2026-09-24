@@ -42,6 +42,7 @@ def test_realtime_stream_requires_read_key_and_projects_public_quote_fields(monk
         kis_quote(price=""),  # malformed price is dropped, never fabricated
     ])
     app.dependency_overrides[routes.realtime_service] = lambda: service
+    app.dependency_overrides[routes.order_notifications] = lambda: None
     try:
         client = TestClient(app)
         path = "/api/integrations/aura/realtime/stream?stock_code=005930"
@@ -55,6 +56,7 @@ def test_realtime_stream_requires_read_key_and_projects_public_quote_fields(monk
             events = [json.loads(line) for line in response.iter_lines() if line]
         assert service.subscriptions == ["005930"] and service.stopped
         assert events == [
+            {"type": "notifications", "state": "DISABLED"},
             {"type": "connection", "state": "connected"},
             {"type": "subscription", "success": True},
             {"type": "quote", "stock_code": "005930", "price": 70100, "change": -400, "change_rate": -0.57,
@@ -76,6 +78,7 @@ def test_idle_stream_sends_heartbeat_and_stops_kis_session_when_mone_disconnects
     async def scenario():
         service = Silent([])
         stream = realtime_events(service, "005930", heartbeat=0.01)
+        assert json.loads(await anext(stream)) == {"type": "notifications", "state": "DISABLED"}
         assert json.loads(await anext(stream)) == {"type": "heartbeat"}
         await stream.aclose()
         return service
@@ -147,3 +150,34 @@ def test_h0stasp0_orderbook_is_parsed_with_official_column_order_and_subscribed_
 
     asyncio.run(scenario())
     assert sent == [{"tr_id": "H0STCNT0", "tr_key": "005930"}, {"tr_id": "H0STASP0", "tr_key": "005930"}]
+
+
+def test_order_notices_reach_mone_only_through_the_lifecycle_processor(monkeypatch):
+    monkeypatch.setattr(routes.settings, "AURA_INTEGRATION_READ_KEY", "test-read-key")
+    raw = {"type": "order_notice", "account_no": "5012345601", "customer_id": "HTSUSER1", "fill_flag": "2"}
+
+    class Processor:
+        def __init__(self):
+            self.seen = []
+
+        def apply(self, notice):
+            self.seen.append(notice)
+            return {"type": "order_notice", "kind": "FILL", "order_id": "ORDER-1", "status": "FILLED"}
+
+    class Broken:
+        def apply(self, notice):
+            raise RuntimeError("store unavailable")
+
+    for processor, expected in ((Processor(), [{"type": "order_notice", "kind": "FILL", "order_id": "ORDER-1",
+                                                 "status": "FILLED"}]), (Broken(), [])):
+        app.dependency_overrides[routes.realtime_service] = lambda: FakeRealtimeService([raw])
+        app.dependency_overrides[routes.order_notifications] = lambda p=processor: p
+        try:
+            with TestClient(app).stream("GET", "/api/integrations/aura/realtime/stream?stock_code=005930",
+                                        headers={"X-Aura-Read-Key": "test-read-key"}) as response:
+                lines = [json.loads(line) for line in response.iter_lines() if line]
+        finally:
+            app.dependency_overrides.clear()
+        assert lines[0] == {"type": "notifications", "state": "ENABLED"}
+        assert lines[1:] == expected  # raw account fields never forwarded; a failing processor is skipped
+        assert "5012345601" not in json.dumps(lines)
