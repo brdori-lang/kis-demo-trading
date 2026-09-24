@@ -123,10 +123,15 @@ def order_notifications():
 
 
 @router.get("/realtime/stream", dependencies=[Depends(require_aura_read_key)])
-def realtime_stream(stock_code: str = Query(pattern=r"^[0-9]{6}$"), service=Depends(realtime_service),
-                    notices=Depends(order_notifications)):
+def realtime_stream(stock_code: str | None = Query(None, pattern=r"^[0-9]{6}$"),
+                    stock_codes: str | None = Query(None, pattern=r"^[0-9]{6}(,[0-9]{6}){0,19}$"),
+                    service=Depends(realtime_service), notices=Depends(order_notifications)):
     # One LAB-owned KIS VTS WebSocket session per M:ONE relay; closed when M:ONE disconnects.
-    return StreamingResponse(realtime_events(service, stock_code, notices=notices),
+    # stock_codes (max 20) lets M:ONE's market collector cover its watchlist with one session.
+    if (stock_code is None) == (stock_codes is None):
+        raise HTTPException(422, "stock_code 또는 stock_codes 중 하나만 지정하세요.")
+    codes = stock_code if stock_codes is None else stock_codes.split(",")
+    return StreamingResponse(realtime_events(service, codes, notices=notices),
                              media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"})
 
 

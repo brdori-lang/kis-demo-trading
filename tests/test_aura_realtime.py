@@ -183,3 +183,33 @@ def test_order_notices_reach_mone_only_through_the_lifecycle_processor(monkeypat
         assert lines[0] == {"type": "notifications", "state": "ENABLED"}
         assert lines[1:] == expected  # raw account fields never forwarded; a failing processor is skipped
         assert "5012345601" not in json.dumps(lines)
+
+
+def test_one_stream_serves_the_mone_collector_watchlist_with_one_kis_session(monkeypatch):
+    monkeypatch.setattr(routes.settings, "AURA_INTEGRATION_READ_KEY", "test-read-key")
+    services = []
+
+    def one_service():
+        services.append(FakeRealtimeService([kis_quote(), kis_quote(stock_code="000660", price="180000"),
+                                             kis_quote(stock_code="035420", price="200000")]))
+        return services[-1]
+
+    app.dependency_overrides[routes.realtime_service] = one_service
+    app.dependency_overrides[routes.order_notifications] = lambda: None
+    headers = {"X-Aura-Read-Key": "test-read-key"}
+    try:
+        client = TestClient(app)
+        base = "/api/integrations/aura/realtime/stream"
+        with client.stream("GET", f"{base}?stock_codes=005930,000660,005930", headers=headers) as response:
+            assert response.status_code == 200
+            events = [json.loads(line) for line in response.iter_lines() if line]
+        assert len(services) == 1 and services[0].subscriptions == ["005930", "000660"] and services[0].stopped
+        assert [(e["stock_code"], e["price"]) for e in events if e["type"] == "quote"] == [
+            ("005930", 70100), ("000660", 180000)]                      # 035420 was not requested
+        too_many = ",".join(f"{n:06d}" for n in range(21))
+        for bad in (f"{base}?stock_codes={too_many}", f"{base}?stock_codes=005930,5930", base,
+                    f"{base}?stock_code=005930&stock_codes=000660"):
+            assert client.get(bad, headers=headers).status_code == 422
+        assert all(not s.subscriptions for s in services[1:])          # rejected requests never subscribe
+    finally:
+        app.dependency_overrides.clear()

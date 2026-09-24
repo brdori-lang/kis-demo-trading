@@ -11,6 +11,8 @@ from collections.abc import AsyncIterator
 
 
 HEARTBEAT_SECONDS = 15.0
+# KIS allows 41 realtime registrations per session: 2 market TRs per symbol + the order notice TR.
+MAX_STREAM_SYMBOLS = 20
 logger = logging.getLogger(__name__)
 
 
@@ -73,15 +75,17 @@ def public_orderbook(event: dict) -> dict | None:
     }
 
 
-def public_event(event: dict, stock_code: str) -> dict | None:
+def public_event(event: dict, stock_codes: str | frozenset[str]) -> dict | None:
+    if isinstance(stock_codes, str):
+        stock_codes = frozenset((stock_codes,))
     kind = event.get("type")
     if kind == "connection":
         return {"type": "connection", "state": event.get("state")}
     if kind == "status":
         return {"type": "subscription", "success": bool(event.get("success"))}
-    if kind == "quote" and event.get("stock_code") == stock_code:
+    if kind == "quote" and event.get("stock_code") in stock_codes:
         return public_quote(event)
-    if kind == "orderbook" and event.get("stock_code") == stock_code:
+    if kind == "orderbook" and event.get("stock_code") in stock_codes:
         return public_orderbook(event)
     return None
 
@@ -96,12 +100,21 @@ def _apply_notice(notices, event: dict) -> dict | None:
         return None
 
 
-async def realtime_events(service, stock_code: str, heartbeat: float = HEARTBEAT_SECONDS,
+async def realtime_events(service, stock_codes: str | list[str], heartbeat: float = HEARTBEAT_SECONDS,
                           notices=None) -> AsyncIterator[str]:
-    """Yield NDJSON lines until the client disconnects; always stops the KIS session."""
+    """Yield NDJSON lines until the client disconnects; always stops the KIS session.
+
+    One KIS WebSocket session serves every requested symbol (M:ONE's market collector asks for its
+    whole watchlist at once instead of opening a session per symbol).
+    """
+    codes = [stock_codes] if isinstance(stock_codes, str) else list(dict.fromkeys(stock_codes))
+    if not codes or len(codes) > MAX_STREAM_SYMBOLS:
+        raise ValueError("unsupported number of realtime symbols")
     queue: asyncio.Queue = asyncio.Queue()
-    await service.subscribe(stock_code)
+    for code in codes:
+        await service.subscribe(code)
     await service.start(queue.put)
+    wanted = frozenset(codes)
     try:
         yield json.dumps({"type": "notifications", "state": "ENABLED" if notices is not None else "DISABLED"}) + "\n"
         while True:
@@ -115,7 +128,7 @@ async def realtime_events(service, stock_code: str, heartbeat: float = HEARTBEAT
             if event.get("type") == "order_notice":
                 item = _apply_notice(notices, event)  # projected by the processor; raw account fields dropped
             else:
-                item = public_event(event, stock_code)
+                item = public_event(event, wanted)
             if item:
                 yield json.dumps(item, ensure_ascii=False) + "\n"
     finally:
