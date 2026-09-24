@@ -114,7 +114,8 @@ def realtime_service():
 
 def order_notifications():
     # H0STCNI9 needs the HTS ID; without it notices stay off and polling/reconciliation remain.
-    if not settings.KIS_HTS_ID:
+    from realtime_quotes import valid_hts_id
+    if not valid_hts_id(settings.KIS_HTS_ID):
         return None
     from app.main import kis_order_service
     from order_notifications import OrderNotificationProcessor

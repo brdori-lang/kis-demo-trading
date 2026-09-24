@@ -38,7 +38,8 @@ def test_notice_subscription_is_vts_only_and_keys_come_from_the_subscribe_respon
     message = json.loads(quotes.notice_subscription_message("approval", "HTSUSER1", True))
     assert message["body"]["input"] == {"tr_id": "H0STCNI9", "tr_key": "HTSUSER1"}
     assert quotes.REALTIME_ORDER_NOTICE_TR_ID == "H0STCNI9"  # the real-account H0STCNI0 is never used
-    for bad in ("", "a^b", "x" * 17):
+    assert json.loads(quotes.notice_subscription_message("approval", "user@k1", True))["body"]["input"]["tr_key"] == "user@k1"
+    for bad in ("", "has space", "x" * 13, "한글아이디"):
         with pytest.raises(ValueError):
             quotes.notice_subscription_message("approval", bad, True)
     assert quotes.subscription_cipher(SUBSCRIBE_SUCCESS) == ("H0STCNI9", KEY.encode(), IV.encode())
@@ -161,3 +162,12 @@ def test_reject_and_cancel_notices_and_unknown_orders(store):
     assert (rejected["status"], rejected["side"]) == ("REJECTED", "SELL")
     unknown = processor.apply(fill(1) | {"order_no": "0000055555"})
     assert unknown["order_id"] is None and unknown["kind"] == "FILL" and "status" not in unknown
+
+
+def test_an_invalid_hts_id_turns_notices_off_but_keeps_market_data(monkeypatch):
+    import app.aura_routes as routes
+    service = quotes.RealtimeQuoteService(notice_tr_key="bad id with spaces")
+    assert service.notice_tr_key is None and service.tr_ids == ("H0STCNT0",)
+    monkeypatch.setattr(routes.settings, "KIS_HTS_ID", "bad id")
+    assert routes.order_notifications() is None
+    assert routes.realtime_service().notice_tr_key is None

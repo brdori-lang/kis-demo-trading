@@ -97,7 +97,7 @@ def orderbook_frame(stock_code="005930", asks=("70200", "70300", "70400"), bids=
     return f"0|{quotes.REALTIME_ORDERBOOK_TR_ID}|1|" + "^".join(values[c] for c in quotes.REALTIME_ORDERBOOK_COLUMNS)
 
 
-def test_h0stasp0_orderbook_is_parsed_with_official_column_order_and_subscribed_with_price():
+def test_h0stasp0_orderbook_is_parsed_with_official_column_order_and_subscribed_with_price(monkeypatch):
     import asyncio
     import realtime_quotes as quotes
     from aura_realtime import public_event
@@ -135,6 +135,8 @@ def test_h0stasp0_orderbook_is_parsed_with_official_column_order_and_subscribed_
 
         async def recv(self):
             await asyncio.Event().wait()
+
+    monkeypatch.setattr(routes.settings, "KIS_HTS_ID", "")  # market TRs only; notices covered elsewhere
 
     async def scenario():
         service = routes.realtime_service()

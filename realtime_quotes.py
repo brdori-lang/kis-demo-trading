@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 
@@ -98,8 +99,16 @@ def subscription_message(approval_key: str, stock_code: str, subscribe: bool,
     )
 
 
+# tr_key = HTS ID: string, length 12 [실시간-005]. Printable ASCII without spaces.
+HTS_ID_PATTERN = re.compile(r"[!-~]{1,12}")
+
+
+def valid_hts_id(hts_id: str | None) -> bool:
+    return bool(hts_id) and HTS_ID_PATTERN.fullmatch(hts_id) is not None
+
+
 def notice_subscription_message(approval_key: str, hts_id: str, subscribe: bool) -> str:
-    if not hts_id or len(hts_id) > 16 or not hts_id.isascii() or not hts_id.isalnum():
+    if not valid_hts_id(hts_id):
         raise ValueError("HTS ID 형식이 올바르지 않습니다.")
     return json.dumps(
         {
@@ -193,6 +202,9 @@ class RealtimeQuoteService:
         self.approval_provider = approval_provider
         self.connect_factory = connect_factory
         self.tr_ids = tuple(tr_ids)
+        if notice_tr_key and not valid_hts_id(notice_tr_key):
+            logger.warning("KIS_HTS_ID format is invalid; realtime order notices stay off")
+            notice_tr_key = None  # never let a bad HTS ID take market data down with it
         self.notice_tr_key = notice_tr_key  # HTS ID for H0STCNI9; None keeps notices off
         self._ciphers: dict[str, tuple[bytes, bytes]] = {}
         self.subscriptions: set[str] = set()
