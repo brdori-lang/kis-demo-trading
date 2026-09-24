@@ -1,9 +1,10 @@
 import hmac
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
+from aura_realtime import realtime_events
 from aura_integration import AuraExecutionPlan, AuraIntegrationService, ConfirmPreview, Identifier, IntegrationError
 from kis_virtual_orders import OrderSafetyError
 from kis_api import get_buying_power
@@ -103,6 +104,18 @@ def cancel_order(order_id: Identifier, service=Depends(order_service)):
         raise HTTPException(409, "취소 가능한 미체결 주문이 아닙니다.")
     result = service.cancel(order_id)
     return {"order": public_order(result)}
+
+
+def realtime_service():
+    from realtime_quotes import RealtimeQuoteService
+    return RealtimeQuoteService()
+
+
+@router.get("/realtime/stream", dependencies=[Depends(require_aura_read_key)])
+def realtime_stream(stock_code: str = Query(pattern=r"^[0-9]{6}$"), service=Depends(realtime_service)):
+    # One LAB-owned KIS VTS WebSocket session per M:ONE relay; closed when M:ONE disconnects.
+    return StreamingResponse(realtime_events(service, stock_code), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-cache"})
 
 
 @router.post("/previews")
