@@ -255,6 +255,10 @@ class RealtimeQuoteService:
                     retry = 0
                     self._ciphers.clear()  # every subscription answers with its own AES key/IV
                     await handler({"type": "connection", "state": self.state})
+                    # The full set is (re)sent right here, so commands queued before this point are stale
+                    # (they would subscribe twice or unsubscribe a symbol that is no longer registered).
+                    while not self.commands.empty():
+                        self.commands.get_nowait()
                     for stock_code in sorted(self.subscriptions):
                         for tr_id in self.tr_ids:
                             await websocket.send(subscription_message(approval_key, stock_code, True, tr_id))

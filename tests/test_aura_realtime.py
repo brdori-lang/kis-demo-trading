@@ -58,7 +58,7 @@ def test_realtime_stream_requires_read_key_and_projects_public_quote_fields(monk
         assert events == [
             {"type": "notifications", "state": "DISABLED"},
             {"type": "connection", "state": "connected"},
-            {"type": "subscription", "success": True},
+            {"type": "subscription", "success": True, "stock_code": "005930"},
             {"type": "quote", "stock_code": "005930", "price": 70100, "change": -400, "change_rate": -0.57,
              "trade_volume": 12, "accumulated_volume": 900, "trade_time": "101530",
              "business_date": "20260924"},

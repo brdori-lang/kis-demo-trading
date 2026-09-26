@@ -4,7 +4,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
-from aura_realtime import realtime_events
+import secrets
+
+from pydantic import BaseModel, Field
+
+from aura_realtime import MAX_STREAM_SYMBOLS, realtime_events, update_stream_symbols
 from aura_integration import AuraExecutionPlan, AuraIntegrationService, ConfirmPreview, Identifier, IntegrationError
 from kis_virtual_orders import OrderSafetyError
 from kis_api import get_buying_power
@@ -131,8 +135,27 @@ def realtime_stream(stock_code: str | None = Query(None, pattern=r"^[0-9]{6}$"),
     if (stock_code is None) == (stock_codes is None):
         raise HTTPException(422, "stock_code 또는 stock_codes 중 하나만 지정하세요.")
     codes = stock_code if stock_codes is None else stock_codes.split(",")
-    return StreamingResponse(realtime_events(service, codes, notices=notices),
+    stream_id = secrets.token_urlsafe(16) if stock_codes is not None else None   # the collector's stream
+    return StreamingResponse(realtime_events(service, codes, notices=notices, stream_id=stream_id),
                              media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"})
+
+
+class RealtimeSubscriptions(BaseModel):
+    stream_id: str = Field(pattern=r"^[A-Za-z0-9_-]{16,64}$")
+    stock_codes: list[str] = Field(min_length=1, max_length=MAX_STREAM_SYMBOLS)
+
+
+@router.put("/realtime/subscriptions", dependencies=[Depends(require_aura_read_key)])
+async def realtime_subscriptions(payload: RealtimeSubscriptions):
+    # M:ONE's market collector changes its open stream's symbols on the same KIS session (no reconnect).
+    # async on purpose: it runs on the event loop that owns the stream's RealtimeQuoteService.
+    try:
+        result = await update_stream_symbols(payload.stream_id, payload.stock_codes)
+    except ValueError as exc:
+        raise HTTPException(422, "종목코드는 6자리 숫자 1~20개여야 합니다.") from exc
+    if result is None:
+        raise HTTPException(404, "열린 실시간 스트림이 없습니다.")
+    return result
 
 
 @router.post("/previews")
