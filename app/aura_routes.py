@@ -9,7 +9,9 @@ import secrets
 from pydantic import BaseModel, Field
 
 from aura_realtime import MAX_STREAM_SYMBOLS, realtime_events, update_stream_symbols
-from aura_integration import AuraExecutionPlan, AuraIntegrationService, ConfirmPreview, Identifier, IntegrationError
+from aura_integration import (
+    AuraExecutionPlan, AuraIntegrationService, AuraManualOrder, ConfirmPreview, Identifier, IntegrationError,
+)
 from kis_virtual_orders import OrderSafetyError
 from kis_api import get_buying_power
 from config import settings
@@ -67,10 +69,22 @@ def order_service():
     return kis_order_service()
 
 
-def public_order(order: dict) -> dict:
+def public_order(order: dict, origins: dict | None = None) -> dict:
     fields = ("id", "created_at", "stock_code", "side", "quantity", "filled_quantity",
               "remaining_quantity", "requested_price", "status")
-    return {name: order.get(name) for name in fields}
+    item = {name: order.get(name) for name in fields}
+    if origins is not None:
+        # Provenance for M:ONE: which of its executions sent this order (None: not sent by M:ONE).
+        execution_id, origin = origins.get(order.get("id"), (None, None))
+        item.update(mone_execution_id=execution_id, mone_origin=origin)
+    return item
+
+
+def order_origins(service=Depends(integration_service)):
+    try:
+        return service.store.origins()
+    except Exception:
+        return None   # unknown provenance is reported as unknown, never as external
 
 
 def public_reconciliation(run: dict | None) -> dict | None:
@@ -81,10 +95,10 @@ def public_reconciliation(run: dict | None) -> dict | None:
 
 
 @router.get("/orders", dependencies=[Depends(require_aura_read_key)])
-def orders(refresh: bool = Query(False), service=Depends(order_service)):
+def orders(refresh: bool = Query(False), service=Depends(order_service), origins=Depends(order_origins)):
     if refresh:
         service.refresh()
-    return {"orders": [public_order(item) for item in service.store.list()[:50]]}
+    return {"orders": [public_order(item, origins) for item in service.store.list()[:50]]}
 
 
 @router.get("/reconciliation", dependencies=[Depends(require_aura_read_key)])
@@ -160,6 +174,12 @@ async def realtime_subscriptions(payload: RealtimeSubscriptions):
 
 @router.post("/previews")
 def preview(payload: AuraExecutionPlan, service=Depends(integration_service)):
+    return service.preview(payload)
+
+
+@router.post("/manual-previews")
+def manual_preview(payload: AuraManualOrder, service=Depends(integration_service)):
+    # M:ONE manual order (no research decision): same preview hash, confirmation and submit path.
     return service.preview(payload)
 
 

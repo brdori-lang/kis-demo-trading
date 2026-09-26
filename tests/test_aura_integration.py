@@ -415,3 +415,70 @@ def test_only_one_new_table_and_no_order_schema_change(context):
         order_columns = {row[1] for row in db.execute("PRAGMA table_info(kis_virtual_orders)").fetchall()}
     assert "source_idempotency_key" in columns and "lab_order_id" in columns
     assert "plan_id" not in order_columns and "execution_id" not in order_columns
+
+
+# ----- M:ONE manual orders (no research decision) ---------------------------------------------------
+def manual(**overrides):
+    data = {"origin": "MONE_MANUAL", "plan_id": "MANUAL-demo-001", "idempotency_key": "mone-manual-demo-001",
+            "created_at": NOW.isoformat(), "symbol": "373220", "side": "BUY", "target_quantity": 2,
+            "reference_price": 70000, "valid_until": (NOW + timedelta(minutes=10)).isoformat(),
+            "execution_mode": "KIS_VIRTUAL"}
+    return {**data, **overrides}
+
+
+def test_manual_order_uses_the_same_preview_confirmation_and_single_submit(context):
+    client, service, broker = context[0], context[1], context[2]
+    response = client.post(BASE + "/manual-previews", json=manual())
+    assert response.status_code == 200, response.text
+    receipt = response.json()
+    assert receipt["status"] == "PREVIEWED" and receipt["execution_id"] == "MANUAL-demo-001"
+    assert (receipt["preview"]["stock_code"], receipt["preview"]["quantity"], receipt["preview"]["price"]) == (
+        "373220", 2, 70000)
+    assert broker.calls == [] and service.orders.store.list() == []          # preview is never an order
+    assert submit(context, receipt, confirmed=False).status_code == 400      # no confirmation, no order
+    assert broker.calls == []
+    first = submit(context, receipt)
+    assert first.status_code == 200 and first.json()["status"] == "ACKNOWLEDGED"
+    assert submit(context, receipt).json()["order_id"] == first.json()["order_id"]   # replay: same order
+    assert len(broker.calls) == 1
+    stored = json.loads(service.store.get("MANUAL-demo-001")["plan_json"])
+    assert stored["origin"] == "MONE_MANUAL" and "decision_id" not in stored
+
+
+@pytest.mark.parametrize("overrides", [
+    {"decision_id": "DEC-invented"}, {"snapshot_id": "SNAP-invented"}, {"strategy_id": "trend-following-v1"},
+    {"confidence": "HIGH"}, {"origin": "AUTO"}, {"plan_id": "PLAN-demo-001"}, {"target_quantity": 0},
+    {"reference_price": 70000.5}, {"reference_price": "70000"}, {"symbol": "AAPL"},
+    {"valid_until": (NOW + timedelta(minutes=31)).isoformat()}, {"execution_mode": "LIVE"},
+    {"account_no": "private-account"},
+])
+def test_manual_contract_cannot_carry_an_invented_decision_or_leave_vts(context, overrides):
+    response = context[0].post(BASE + "/manual-previews", json=manual(**overrides))
+    assert response.status_code == 422
+    assert context[2].calls == [] and "private-account" not in response.text
+
+
+def test_manual_order_is_held_to_the_lab_risk_limits(context, monkeypatch):
+    monkeypatch.setattr(settings, "MAX_ORDER_AMOUNT", 100_000)
+    response = context[0].post(BASE + "/manual-previews", json=manual())
+    assert response.status_code in {400, 409}
+    assert context[2].calls == []
+
+
+def test_order_list_names_mone_manual_mone_plan_and_external_orders(context, monkeypatch):
+    from app.aura_routes import order_service
+    client, service = context[0], context[1]
+    monkeypatch.setattr(settings, "AURA_INTEGRATION_READ_KEY", "test-read-key")
+    main.app.dependency_overrides[order_service] = lambda: service.orders
+    try:
+        submit(context, client.post(BASE + "/manual-previews", json=manual()).json())
+        submit(context, preview(context))
+        service.orders.submit({"idempotency_key": "lab-ui-order-1", "stock_code": "000660", "side": "BUY",
+                               "quantity": 1, "price": 180000, "order_type": "LIMIT",
+                               "execution_mode": "KIS_VIRTUAL"})             # placed in the LAB, not by M:ONE
+        orders = client.get(BASE + "/orders", headers={"X-Aura-Read-Key": "test-read-key"}).json()["orders"]
+    finally:
+        main.app.dependency_overrides.pop(order_service, None)
+    origins = {o["stock_code"]: (o["mone_origin"], o["mone_execution_id"]) for o in orders}
+    assert origins == {"373220": ("MONE_MANUAL", "MANUAL-demo-001"), "005930": ("MONE_PLAN", "PLAN-demo-001"),
+                       "000660": (None, None)}

@@ -111,6 +111,43 @@ class AuraExecutionPlan(ContractModel):
         return self
 
 
+class AuraManualOrder(ContractModel):
+    """A user's own M:ONE order for any supported stock, with no research decision behind it.
+
+    Deliberately narrower than AuraExecutionPlan: there is no decision, snapshot, strategy, regime or
+    confidence field, so none can be invented. It goes through the same preview hash, explicit
+    confirmation, at-most-once submit, status and LAB risk validation as a plan.
+    """
+
+    origin: Literal["MONE_MANUAL"]
+    plan_id: Identifier
+    idempotency_key: str = Field(min_length=8, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+    created_at: AwareDatetime
+    symbol: str = Field(pattern=r"^[0-9]{6}$")
+    side: Literal["BUY", "SELL"]
+    target_quantity: int = Field(gt=0, le=1_000_000, strict=True)
+    reference_price: Decimal = Field(gt=0)
+    valid_until: AwareDatetime
+    execution_mode: Literal["KIS_VIRTUAL"]
+
+    @field_validator("reference_price", mode="before")
+    @classmethod
+    def numeric_price(cls, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            raise ValueError("price must be a JSON number")
+        return value
+
+    @model_validator(mode="after")
+    def actionable(self):
+        if not self.plan_id.startswith("MANUAL-"):
+            raise ValueError("manual order ids start with MANUAL-")
+        if self.valid_until <= self.created_at or self.valid_until - self.created_at > timedelta(minutes=30):
+            raise ValueError("valid_until must be within 30 minutes after created_at")
+        if self.reference_price != self.reference_price.to_integral_value():
+            raise ValueError("reference_price must be an exact integer KRW amount")
+        return self
+
+
 class ConfirmPreview(ContractModel):
     confirmed: StrictBool
     preview_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -200,6 +237,17 @@ class AuraExecutionStore:
         with self.repository._connect() as db:
             row = db.execute("SELECT * FROM aura_execution_links WHERE execution_id=?", (execution_id,)).fetchone()
         return dict(row) if row else None
+
+    def origins(self):
+        """LAB order id -> (M:ONE execution id, origin) for orders M:ONE submitted. Other orders: external."""
+        with self.repository._connect() as db:
+            rows = db.execute("""SELECT execution_id, lab_order_id, plan_json FROM aura_execution_links
+                WHERE lab_order_id IS NOT NULL""").fetchall()
+        result = {}
+        for row in rows:
+            origin = json.loads(row["plan_json"]).get("origin")
+            result[row["lab_order_id"]] = (row["execution_id"], "MONE_MANUAL" if origin == "MONE_MANUAL" else "MONE_PLAN")
+        return result
 
     def create(self, plan, plan_json, plan_hash, snapshot, preview_hash, timestamp):
         # ON CONFLICT works on SQLite and the existing PostgreSQL adapter.
