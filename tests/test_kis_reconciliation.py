@@ -97,13 +97,73 @@ def test_local_only_order_is_mismatch(repository):
     assert result["items"][0]["details"]["reason"] == "LOCAL_ORDER_NOT_FOUND_AT_KIS"
 
 
-def test_position_disagreement_requires_manual_review(repository):
-    service = orders.KISVirtualOrderService(
-        repository, client=ReconciliationClient([]),
-        balance_provider=lambda: {"output1": [{"pdno": "005930", "hldg_qty": "3"}]},
-    )
+class SubmitTrackingClient(ReconciliationClient):
+    def __init__(self, broker_orders):
+        super().__init__(broker_orders)
+        self.submitted = []
 
+    def submit_order(self, *args, **kwargs):
+        self.submitted.append((args, kwargs))
+        raise AssertionError("reconciliation must not submit broker orders")
+
+    def cancel_order(self, *args, **kwargs):
+        self.submitted.append((args, kwargs))
+        raise AssertionError("reconciliation must not cancel broker orders")
+
+
+def reconcile_position(repository, local_quantity, kis_quantity, kis_average="259500"):
+    client = SubmitTrackingClient([])
+    service = orders.KISVirtualOrderService(
+        repository, client=client,
+        balance_provider=lambda: {"output1": [{
+            "pdno": "005930", "hldg_qty": str(kis_quantity), "pchs_avg_pric": kis_average,
+        }]},
+    )
+    if local_quantity:
+        service.store.apply_position_fill("005930", "BUY", local_quantity, 259500)
     result = service.reconcile()
+    assert client.submitted == []
+    [item] = [item for item in result["items"] if item["entity_type"] == "POSITION"]
+    return service, result, item
+
+
+def test_external_holding_without_lab_position_needs_no_review(repository):
+    service, result, item = reconcile_position(repository, 0, 3)
+
+    assert result["manual_review_required"] == 0
+    assert result["mismatch"] == 0
+    assert item["result"] == "MATCHED"
+    assert item["details"]["external_surplus_qty"] == 3
+    assert service.store.positions() == []
+
+
+def test_kis_surplus_over_lab_position_is_external_and_ignores_blended_average(repository):
+    service, result, item = reconcile_position(repository, 2, 3, kis_average="250000")
+
+    assert result["manual_review_required"] == 0
+    assert item["result"] == "MATCHED"
+    assert item["details"]["external_surplus_qty"] == 1
+    assert [(p["quantity"], p["average_price"]) for p in service.store.positions()] == [(2, 259500)]
+
+
+def test_equal_position_with_matching_average_is_matched(repository):
+    _, result, item = reconcile_position(repository, 2, 2)
+
+    assert result["manual_review_required"] == 0
+    assert item["result"] == "MATCHED"
+    assert item["details"]["external_surplus_qty"] == 0
+
+
+def test_equal_position_with_wrong_average_requires_manual_review(repository):
+    _, result, item = reconcile_position(repository, 2, 2, kis_average="250000")
 
     assert result["manual_review_required"] == 1
-    assert result["items"][0]["entity_type"] == "POSITION"
+    assert item["result"] == "MANUAL_REVIEW_REQUIRED"
+
+
+def test_kis_short_of_lab_position_requires_manual_review(repository):
+    _, result, item = reconcile_position(repository, 2, 1)
+
+    assert result["manual_review_required"] == 1
+    assert item["result"] == "MANUAL_REVIEW_REQUIRED"
+    assert item["details"]["external_surplus_qty"] == 0

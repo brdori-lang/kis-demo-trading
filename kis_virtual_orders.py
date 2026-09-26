@@ -678,19 +678,27 @@ class KISVirtualOrderService:
             kis_position = kis_positions.get(stock_code) or {"quantity": 0, "average_price": None}
             local_quantity = local_position["quantity"]
             kis_quantity = kis_position["quantity"]
-            average_matches = (
-                kis_position["average_price"] is None
-                or abs(_number(local_position["average_price"]) - kis_position["average_price"]) < 0.01
-            )
+            # The KIS account may also hold shares LAB never ordered. LAB only claims its own
+            # quantity: a KIS surplus is an external holding, not a LAB discrepancy, and the
+            # blended KIS average price says nothing about LAB's fills.
+            external_surplus_qty = max(kis_quantity - local_quantity, 0)
+            if kis_quantity < local_quantity:
+                matched = False
+            elif external_surplus_qty:
+                matched = True
+            else:
+                matched = (
+                    kis_position["average_price"] is None
+                    or abs(_number(local_position["average_price"]) - kis_position["average_price"]) < 0.01
+                )
             items.append({
-                "result": "MATCHED"
-                if local_quantity == kis_quantity and average_matches
-                else "MANUAL_REVIEW_REQUIRED",
+                "result": "MATCHED" if matched else "MANUAL_REVIEW_REQUIRED",
                 "entity_type": "POSITION", "reference": stock_code,
                 "details": {
                     "local_quantity": local_quantity, "kis_quantity": kis_quantity,
                     "local_average_price": local_position["average_price"],
                     "kis_average_price": kis_position["average_price"],
+                    "external_surplus_qty": external_surplus_qty,
                 },
             })
         return self.store.save_reconciliation(items)
