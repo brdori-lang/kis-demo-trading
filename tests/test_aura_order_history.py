@@ -65,6 +65,43 @@ def test_order_history_and_reconciliation_are_authenticated_and_projected(monkey
         app.dependency_overrides.clear()
 
 
+def test_order_events_are_authenticated_read_only_and_expose_only_the_broker_reason(monkeypatch, tmp_path):
+    import kis_virtual_orders as orders
+    from lab_repository import SQLiteLabRepository
+
+    monkeypatch.setattr(routes.settings, "AURA_INTEGRATION_READ_KEY", "test-read-key")
+
+    class NoOrderClient:
+        def __getattr__(self, name):
+            raise AssertionError(f"order events must not call KIS ({name})")
+
+    service = orders.KISVirtualOrderService(SQLiteLabRepository(tmp_path / "events.db"), client=NoOrderClient(),
+                                            balance_provider=lambda: {"output1": []})
+    item = service.store.create({"idempotency_key": "events-key-0001", "stock_code": "005930", "side": "BUY",
+                                 "quantity": 1, "price": 286500, "order_type": "LIMIT"})
+    service.store.transition(item["id"], "VALIDATED")
+    service.store.transition(item["id"], "SUBMITTING")
+    service.store.transition(item["id"], "REJECTED",
+                             {"message_code": "40100000", "message": "모의투자 영업일이 아닙니다.",
+                              "raw": "private-payload"}, last_error="모의투자 영업일이 아닙니다.")
+    app.dependency_overrides[routes.order_service] = lambda: service
+    try:
+        client = TestClient(app)
+        path = f"/api/integrations/aura/orders/{item['id']}/events"
+        assert client.get(path).status_code == 403
+        headers = {"X-Aura-Read-Key": "test-read-key"}
+        body = client.get(path, headers=headers).json()
+        assert body["order_id"] == item["id"] and body["status"] == "REJECTED"
+        assert [e["event_type"] for e in body["events"]] == ["CREATED", "VALIDATED", "SUBMITTING", "REJECTED"]
+        rejected = body["events"][-1]
+        assert (rejected["message_code"], rejected["message"]) == ("40100000", "모의투자 영업일이 아닙니다.")
+        assert all(e["at"] for e in body["events"]) and "private" not in str(body)
+        assert client.get("/api/integrations/aura/orders/NOPE-1/events", headers=headers).status_code == 404
+        assert service.store.get(item["id"])["status"] == "REJECTED"     # read-only
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_cancel_requires_explicit_authenticated_action_and_remaining_quantity(monkeypatch):
     monkeypatch.setattr(routes.settings, "AURA_INTEGRATION_READ_KEY", "test-read-key")
     service = FakeService()

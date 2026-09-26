@@ -101,6 +101,27 @@ def orders(refresh: bool = Query(False), service=Depends(order_service), origins
     return {"orders": [public_order(item, origins) for item in service.store.list()[:50]]}
 
 
+PUBLIC_EVENT_DETAILS = ("message_code", "message", "source", "notice")
+
+
+def public_event(event: dict) -> dict:
+    # Only the broker's own code/message and where the event came from; never raw payloads.
+    details = event.get("details") or {}
+    item = {"at": event.get("created_at"), "event_type": event.get("event_type")}
+    item.update({key: str(details[key])[:200] for key in PUBLIC_EVENT_DETAILS if details.get(key) not in (None, "")})
+    return item
+
+
+@router.get("/orders/{order_id}/events", dependencies=[Depends(require_aura_read_key)])
+def order_events(order_id: Identifier, service=Depends(order_service)):
+    # Read-only: the recorded status events of one order (M:ONE trade journal: ack / fill / reject reason).
+    order = service.store.get(order_id)
+    if not order:
+        raise HTTPException(404, "주문을 찾을 수 없습니다.")
+    return {"order_id": order_id, "status": order["status"],
+            "events": [public_event(event) for event in service.store.events(order_id)]}
+
+
 @router.get("/reconciliation", dependencies=[Depends(require_aura_read_key)])
 def reconciliation(service=Depends(order_service)):
     runs = service.store.reconciliation_runs(1)
