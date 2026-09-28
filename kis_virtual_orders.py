@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -21,6 +22,11 @@ ORDER_INQUIRY_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 ORDER_TR_IDS = {"BUY": "VTTC0012U", "SELL": "VTTC0011U"}
 CANCEL_TR_ID = "VTTC0013U"
 ORDER_INQUIRY_TR_ID = "VTTC0081R"
+# KIS continuation: response header tr_cont "F"/"M" = more rows follow; the next request sends
+# tr_cont "N" with the ctx_area_fk100 / ctx_area_nk100 values of the previous response.
+ORDER_INQUIRY_MORE = {"F", "M"}
+ORDER_INQUIRY_MAX_PAGES = 50
+ORDER_INQUIRY_PAGE_INTERVAL_SECONDS = 1.05   # same spacing as kis_api's KIS REST throttle
 ORDER_DIVISIONS = {"LIMIT": "00", "MARKET": "01"}
 TERMINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "ERROR"}
 
@@ -71,9 +77,10 @@ def require_order_submission_enabled(execution_mode="KIS_VIRTUAL"):
 
 
 class KISVirtualOrderClient:
-    def __init__(self, post_transport=None, get_transport=None):
+    def __init__(self, post_transport=None, get_transport=None, sleep=None):
         self.post_transport = post_transport or httpx.post
         self.get_transport = get_transport or httpx.get
+        self.sleep = sleep or time.sleep
 
     def build_order_request(self, stock_code, side, quantity, price, order_type):
         validate_order_values(stock_code, side, quantity, price, order_type)
@@ -157,30 +164,52 @@ class KISVirtualOrderClient:
         inquiry_date = inquiry_date or datetime.now().strftime("%Y%m%d")
         url = f"{KIS_VTS_REST_BASE_URL}{ORDER_INQUIRY_PATH}"
         require_vts_rest_url(url)
-        response = self.get_transport(
-            url,
-            headers={
+        # KIS returns one page at a time (VTS: 15 rows). Follow the continuation until the last page;
+        # a partial list would make reconciliation report real orders as missing.
+        orders, seen, context = [], set(), ("", "")
+        for page in range(ORDER_INQUIRY_MAX_PAGES):
+            headers = {
                 "authorization": f"Bearer {get_access_token()}",
                 "appkey": settings.KIS_APP_KEY,
                 "appsecret": settings.KIS_APP_SECRET,
                 "tr_id": ORDER_INQUIRY_TR_ID,
                 "custtype": "P",
-            },
-            params={
-                "CANO": cano, "ACNT_PRDT_CD": product_code,
-                "INQR_STRT_DT": inquiry_date, "INQR_END_DT": inquiry_date,
-                "SLL_BUY_DVSN_CD": "00", "PDNO": "", "CCLD_DVSN": "00",
-                "INQR_DVSN": "00", "INQR_DVSN_3": "00", "ORD_GNO_BRNO": "",
-                "ODNO": "", "INQR_DVSN_1": "", "CTX_AREA_FK100": "",
-                "CTX_AREA_NK100": "", "EXCG_ID_DVSN_CD": "KRX",
-            },
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("rt_cd") != "0":
-            raise RuntimeError("KIS VTS 주문 조회에 실패했습니다.")
-        return [normalize_broker_order(item) for item in payload.get("output1") or []]
+            }
+            if page:
+                headers["tr_cont"] = "N"
+                self.sleep(ORDER_INQUIRY_PAGE_INTERVAL_SECONDS)
+            response = self.get_transport(
+                url,
+                headers=headers,
+                params={
+                    "CANO": cano, "ACNT_PRDT_CD": product_code,
+                    "INQR_STRT_DT": inquiry_date, "INQR_END_DT": inquiry_date,
+                    "SLL_BUY_DVSN_CD": "00", "PDNO": "", "CCLD_DVSN": "00",
+                    "INQR_DVSN": "00", "INQR_DVSN_3": "00", "ORD_GNO_BRNO": "",
+                    "ODNO": "", "INQR_DVSN_1": "", "CTX_AREA_FK100": context[0],
+                    "CTX_AREA_NK100": context[1], "EXCG_ID_DVSN_CD": "KRX",
+                },
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("rt_cd") != "0":
+                raise RuntimeError("KIS VTS 주문 조회에 실패했습니다.")
+            for item in payload.get("output1") or []:
+                order = normalize_broker_order(item)
+                if order["broker_order_id"] in seen:
+                    continue            # a row repeated across pages is one order
+                seen.add(order["broker_order_id"])
+                orders.append(order)
+            if (response.headers.get("tr_cont") or "").strip() not in ORDER_INQUIRY_MORE:
+                return orders
+            following = ((payload.get("ctx_area_fk100") or "").strip(), (payload.get("ctx_area_nk100") or "").strip())
+            if not any(following) or following == context:
+                # "More rows" without a new position cannot be followed safely: fail instead of
+                # returning a partial list that would look like missing orders.
+                raise RuntimeError("KIS VTS 주문 조회 연속조회 정보가 올바르지 않습니다.")
+            context = following
+        raise RuntimeError("KIS VTS 주문 조회 페이지 수가 한도를 초과했습니다.")
 
     def cancel_order(self, order):
         require_order_submission_enabled(order.get("execution_mode"))
@@ -239,12 +268,19 @@ def _number(value):
 def normalize_broker_order(item):
     quantity = _integer(item.get("ord_qty"))
     remaining = _integer(item.get("rmn_qty"))
-    filled = _integer(item.get("tot_ccld_qty"))
-    if not filled and quantity >= remaining:
-        filled = quantity - remaining
+    cancel_confirmed = _integer(item.get("cncl_cfrm_qty"))
+    if item.get("tot_ccld_qty") not in (None, ""):
+        filled = _integer(item.get("tot_ccld_qty"))         # KIS's filled quantity is authoritative
+    else:
+        filled = max(quantity - remaining - cancel_confirmed, 0)
+    # cncl_yn "Y" marks KIS's cancel-request row itself; its orgn_odno is the order it cancels.
     canceled = item.get("cncl_yn") == "Y"
+    original = (item.get("orgn_odno") or "").strip()
     status = (
         "CANCELED" if canceled else "FILLED" if quantity > 0 and filled >= quantity
+        # Nothing left open and the rest confirmed canceled: terminal CANCELED, the same state
+        # LAB's own cancel() records (remaining 0, filled quantity kept).
+        else "CANCELED" if cancel_confirmed > 0 and remaining == 0
         else "PARTIALLY_FILLED" if filled > 0 else "ACKNOWLEDGED"
     )
     return {
@@ -261,6 +297,8 @@ def normalize_broker_order(item):
         "order_time": item.get("ord_tmd"),
         "status": status,
         "canceled": canceled,
+        "cancel_confirmed_quantity": cancel_confirmed,
+        "original_order_id": original if canceled and original.strip("0") else None,
     }
 
 
@@ -624,6 +662,15 @@ class KISVirtualOrderService:
 
         for broker in broker_orders:
             local = local_by_broker.get(broker["broker_order_id"])
+            if not local and broker.get("original_order_id") in local_by_broker:
+                # KIS lists a cancel request as its own row pointing (orgn_odno) at the local order
+                # it canceled. It is not a separate order; the original order is compared itself.
+                items.append({
+                    "result": "MATCHED", "entity_type": "CANCEL_REQUEST",
+                    "reference": broker["broker_order_id"],
+                    "details": {"original_order_id": broker["original_order_id"]},
+                })
+                continue
             if not local:
                 items.append({
                     "result": "MANUAL_REVIEW_REQUIRED", "entity_type": "ORDER",
