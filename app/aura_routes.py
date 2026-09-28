@@ -12,7 +12,7 @@ from aura_realtime import MAX_STREAM_SYMBOLS, realtime_events, update_stream_sym
 from aura_integration import (
     AuraExecutionPlan, AuraIntegrationService, AuraManualOrder, ConfirmPreview, Identifier, IntegrationError,
 )
-from kis_virtual_orders import OrderSafetyError
+from kis_virtual_orders import OrderSafetyError, require_order_submission_enabled
 from kis_api import get_buying_power
 from config import settings
 
@@ -98,7 +98,17 @@ def public_reconciliation(run: dict | None) -> dict | None:
 def orders(refresh: bool = Query(False), service=Depends(order_service), origins=Depends(order_origins)):
     if refresh:
         service.refresh()
-    return {"orders": [public_order(item, origins) for item in service.store.list()[:50]]}
+    return {"orders": [public_order(item, origins) for item in service.store.list()[:50]],
+            "submit_enabled": submission_enabled()}
+
+
+def submission_enabled() -> bool:
+    """Whether the LAB would send a KIS VTS order now: the same gate every submission passes first."""
+    try:
+        require_order_submission_enabled()
+    except Exception:
+        return False
+    return True
 
 
 PUBLIC_EVENT_DETAILS = ("message_code", "message", "source", "notice")

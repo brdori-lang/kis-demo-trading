@@ -119,3 +119,21 @@ def test_cancel_requires_explicit_authenticated_action_and_remaining_quantity(mo
         assert service.cancels == 1
     finally:
         app.dependency_overrides.clear()
+
+
+def test_order_history_reports_whether_the_lab_would_submit(monkeypatch):
+    # M:ONE shows "order submission disabled" instead of "ready" when the LAB's own gate is off.
+    import kis_virtual_orders as orders
+    monkeypatch.setattr(routes.settings, "AURA_INTEGRATION_READ_KEY", "test-read-key")
+    monkeypatch.setattr(orders.settings, "KIS_ENV", "virtual")
+    app.dependency_overrides[routes.order_service] = lambda: FakeService()
+    headers = {"X-Aura-Read-Key": "test-read-key"}
+    try:
+        client = TestClient(app)
+        for paper, vts, expected in [(False, False, False), (True, False, False), (False, True, False), (True, True, True)]:
+            monkeypatch.setattr(orders.settings, "PAPER_ORDER_ENABLED", paper)
+            monkeypatch.setattr(orders.settings, "KIS_VIRTUAL_ORDER_SUBMIT_ENABLED", vts)
+            body = client.get("/api/integrations/aura/orders", headers=headers).json()
+            assert body["submit_enabled"] is expected and body["orders"][0]["id"] == "ORDER-1"
+    finally:
+        app.dependency_overrides.clear()
