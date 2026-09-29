@@ -302,6 +302,45 @@ def normalize_broker_order(item):
     }
 
 
+def canonical_execution_id(broker_order_id, cumulative_filled):
+    """One broker fill has one id, whether the H0STCNI9 notice or the VTTC0081R inquiry sees it.
+
+    The two paths share only two broker facts: the order number (ODER_NO / odno) and the order's
+    cumulative filled quantity after the fill (the inquiry's tot_ccld_qty; for a notice, the
+    filled quantity before it plus CNTG_QTY). Time and price are not shared: the inquiry carries
+    the order time and the average price, the notice the fill's own. The source is not part of it.
+    """
+    return f"{(broker_order_id or '').strip().lstrip('0')}:{cumulative_filled}"
+
+
+class _FillAlreadyRecorded(Exception):
+    pass
+
+
+def _move_position(connection, stock_code, side, quantity, price):
+    row = connection.execute(
+        "SELECT * FROM kis_positions WHERE stock_code=?", (stock_code,)
+    ).fetchone()
+    current_quantity = row["quantity"] if row else 0
+    current_average = row["average_price"] if row else 0
+    if side == "BUY":
+        new_quantity = current_quantity + quantity
+        new_average = (
+            (current_quantity * current_average + quantity * price) / new_quantity
+            if new_quantity else 0
+        )
+    else:
+        new_quantity = max(0, current_quantity - quantity)
+        new_average = current_average if new_quantity else 0
+    connection.execute(
+        """INSERT INTO kis_positions(stock_code,quantity,average_price,updated_at)
+           VALUES (?,?,?,?) ON CONFLICT(stock_code) DO UPDATE SET
+           quantity=excluded.quantity,average_price=excluded.average_price,
+           updated_at=excluded.updated_at""",
+        (stock_code, new_quantity, new_average, now_iso()),
+    )
+
+
 class KISOrderStore:
     def __init__(self, repository):
         self.repository = repository
@@ -395,7 +434,9 @@ class KISOrderStore:
         self.transition(order_id, "CREATED")
         return self.get(order_id)
 
-    def transition(self, order_id, status, details=None, **updates):
+    def transition(self, order_id, status, details=None, filled_at_most=None, **updates):
+        """`filled_at_most`: apply only while the order's filled quantity is not above it (atomic);
+        otherwise nothing is written and the order is returned unchanged."""
         allowed_updates = {
             "broker_order_id", "broker_org_no", "submitted_at", "filled_quantity",
             "remaining_quantity", "average_fill_price", "last_error",
@@ -408,16 +449,21 @@ class KISOrderStore:
         for key, value in updates.items():
             assignments.append(f"{key}=?")
             params.append(value)
+        condition = "id=?"
         params.append(order_id)
+        if filled_at_most is not None:
+            condition += " AND filled_quantity<=?"
+            params.append(filled_at_most)
         safe_details = details or {}
         with self.repository._connect() as connection:
-            connection.execute(
-                f"UPDATE kis_virtual_orders SET {','.join(assignments)} WHERE id=?", params
-            )
-            connection.execute(
-                "INSERT INTO kis_order_events(order_id,event_type,details_json,created_at) VALUES (?,?,?,?)",
-                (order_id, status, json.dumps(safe_details, ensure_ascii=False), now_iso()),
-            )
+            changed = connection.execute(
+                f"UPDATE kis_virtual_orders SET {','.join(assignments)} WHERE {condition} RETURNING id", params
+            ).fetchone()
+            if changed:
+                connection.execute(
+                    "INSERT INTO kis_order_events(order_id,event_type,details_json,created_at) VALUES (?,?,?,?)",
+                    (order_id, status, json.dumps(safe_details, ensure_ascii=False), now_iso()),
+                )
         return self.get(order_id)
 
     def get(self, order_id):
@@ -475,29 +521,51 @@ class KISOrderStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def record_fill(self, order_id, filled_quantity, fill_price, execution_time):
+        """Advance an order to KIS's cumulative `filled_quantity` exactly once, from any path.
+
+        The execution row, the order's filled quantity and the LAB position move in one
+        transaction or not at all. The order is re-read here, never taken from the caller: a
+        notice and an inquiry that both saw "filled 0" race on the compare-and-set below, and the
+        loser finds the fill already applied. Returns the order as it was before this fill, or
+        None when there was nothing left to apply.
+        """
+        for _ in range(3):
+            before = self.get(order_id)
+            previous = before["filled_quantity"] or 0
+            quantity = filled_quantity - previous
+            if quantity <= 0:
+                return None
+            try:
+                with self.repository._connect() as connection:
+                    # The compare-and-set is the first write: it takes the order's row lock
+                    # (SQLite: the database write lock) before anything else is touched.
+                    advanced = connection.execute(
+                        """UPDATE kis_virtual_orders SET filled_quantity=?, updated_at=?
+                           WHERE id=? AND filled_quantity=? RETURNING id""",
+                        (filled_quantity, now_iso(), order_id, previous),
+                    ).fetchone()
+                    if not advanced:
+                        continue    # another path moved the order first: re-read and re-decide
+                    recorded = connection.execute(
+                        """INSERT INTO kis_order_executions(
+                           order_id,broker_execution_id,stock_code,filled_quantity,fill_price,
+                           execution_time,created_at) VALUES (?,?,?,?,?,?,?)
+                           ON CONFLICT(order_id,broker_execution_id) DO NOTHING RETURNING id""",
+                        (order_id, canonical_execution_id(before["broker_order_id"], filled_quantity),
+                         before["stock_code"], quantity, fill_price, execution_time, now_iso()),
+                    ).fetchone()
+                    if not recorded:
+                        raise _FillAlreadyRecorded
+                    _move_position(connection, before["stock_code"], before["side"], quantity, fill_price)
+                return before
+            except _FillAlreadyRecorded:
+                return None     # rolled back: this fill moved the position once already
+        return None
+
     def apply_position_fill(self, stock_code, side, quantity, price):
         with self.repository._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM kis_positions WHERE stock_code=?", (stock_code,)
-            ).fetchone()
-            current_quantity = row["quantity"] if row else 0
-            current_average = row["average_price"] if row else 0
-            if side == "BUY":
-                new_quantity = current_quantity + quantity
-                new_average = (
-                    (current_quantity * current_average + quantity * price) / new_quantity
-                    if new_quantity else 0
-                )
-            else:
-                new_quantity = max(0, current_quantity - quantity)
-                new_average = current_average if new_quantity else 0
-            connection.execute(
-                """INSERT INTO kis_positions(stock_code,quantity,average_price,updated_at)
-                   VALUES (?,?,?,?) ON CONFLICT(stock_code) DO UPDATE SET
-                   quantity=excluded.quantity,average_price=excluded.average_price,
-                   updated_at=excluded.updated_at""",
-                (stock_code, new_quantity, new_average, now_iso()),
-            )
+            _move_position(connection, stock_code, side, quantity, price)
 
     def positions(self):
         with self.repository._connect() as connection:
@@ -604,22 +672,18 @@ class KISVirtualOrderService:
         return results
 
     def _apply_broker_snapshot(self, local, broker):
-        previous_filled = local["filled_quantity"]
         current_filled = broker["filled_quantity"]
-        if current_filled > previous_filled:
-            execution_id = f"{broker['broker_order_id']}:{current_filled}:{broker['average_fill_price']}"
-            added = self.store.add_execution(
-                local["id"], execution_id, local["stock_code"],
-                current_filled - previous_filled, broker["average_fill_price"],
+        if current_filled > local["filled_quantity"]:
+            # `local` may predate a fill notice applied meanwhile: record_fill re-reads the order.
+            self.store.record_fill(
+                local["id"], current_filled, broker["average_fill_price"],
                 "".join(filter(None, [broker["order_date"], broker["order_time"]])),
             )
-            if added:
-                self.store.apply_position_fill(
-                    local["stock_code"], local["side"], current_filled - previous_filled,
-                    broker["average_fill_price"],
-                )
+        # KIS's cumulative fill count only grows. An inquiry below what LAB already recorded lags a
+        # fill notice and never takes the fill back (034020, 2026-09-29: FILLED -> ACKNOWLEDGED -> FILLED).
         return self.store.transition(
             local["id"], broker["status"], {"source": "KIS_VTS_INQUIRY"},
+            filled_at_most=current_filled,
             filled_quantity=current_filled,
             remaining_quantity=broker["remaining_quantity"],
             average_fill_price=broker["average_fill_price"],
@@ -687,7 +751,17 @@ class KISVirtualOrderService:
                 and _number(local["average_fill_price"]) != broker["average_fill_price"],
             ))
             if differs:
-                self._apply_broker_snapshot(local, broker)
+                applied = self._apply_broker_snapshot(local, broker)
+                if applied["filled_quantity"] > broker["filled_quantity"]:
+                    # Not corrected: LAB keeps the fill KIS already notified; the next inquiry catches up.
+                    items.append({
+                        "result": "MISMATCH", "entity_type": "ORDER",
+                        "reference": broker["broker_order_id"],
+                        "details": {"reason": "KIS_INQUIRY_BEHIND_LAB_FILL",
+                                    "local_filled_quantity": applied["filled_quantity"],
+                                    "kis_filled_quantity": broker["filled_quantity"]},
+                    })
+                    continue
                 items.append({
                     "result": "CORRECTED", "entity_type": "ORDER",
                     "reference": broker["broker_order_id"],

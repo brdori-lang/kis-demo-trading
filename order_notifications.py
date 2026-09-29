@@ -95,14 +95,13 @@ class OrderNotificationProcessor:
         fills[key] = quantity
         previous = order["filled_quantity"] or 0
         target = min(order["quantity"], max(previous, sum(fills.values())))
-        delta = target - previous
-        if delta <= 0:
+        if target <= previous:
             return order  # already applied (by polling or an earlier notice)
-        average = ((order["average_fill_price"] or 0) * previous + price * delta) / target
-        broker_id = order["broker_order_id"]
-        if self.store.add_execution(order["id"], f"{broker_id}:{target}:WS", order["stock_code"],
-                                    delta, price, notice.get("fill_time") or ""):
-            self.store.apply_position_fill(order["stock_code"], order["side"], delta, price)
+        before = self.store.record_fill(order["id"], target, price, notice.get("fill_time") or "")
+        if before is None:
+            return self.store.get(order["id"])  # polling applied it while this notice was in flight
+        previous = before["filled_quantity"] or 0
+        average = ((before["average_fill_price"] or 0) * previous + price * (target - previous)) / target
         status = "FILLED" if target >= order["quantity"] else "PARTIALLY_FILLED"
         return self.store.transition(order["id"], status, details, filled_quantity=target,
                                      remaining_quantity=order["quantity"] - target, average_fill_price=average)
